@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Runtime state
+agentforge.db
+memory/journal/
+memory/retrospectives/
+memory/proposals/pending/
+
+# Test cache
+.pytest_cache/

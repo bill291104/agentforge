@@ -1,0 +1,45 @@
+name: feature_development
+version: "1.0"
+tasks:
+  - id: design
+    title: "아키텍처 설계"
+    description: "기능 요구사항을 분석하고 상세 설계 문서를 작성한다."
+    model_tier: sonnet
+    timeout_minutes: 30
+    priority: 1
+    acceptance_criteria:
+      - "설계 문서가 생성되었다"
+      - "주요 컴포넌트와 인터페이스가 명시되었다"
+
+  - id: implement
+    title: "기능 구현"
+    description: "설계 문서를 기반으로 코드를 구현한다."
+    model_tier: haiku
+    timeout_minutes: 60
+    priority: 2
+    depends_on: [design]
+    acceptance_criteria:
+      - "요구된 파일이 생성되었다"
+      - "구문 오류가 없다"
+
+  - id: test
+    title: "테스트 작성 및 실행"
+    description: "구현된 코드에 대한 단위/통합 테스트를 작성하고 통과시킨다."
+    model_tier: haiku
+    timeout_minutes: 30
+    priority: 3
+    depends_on: [implement]
+    acceptance_criteria:
+      - "테스트 파일이 생성되었다"
+      - "모든 테스트가 통과한다"
+
+  - id: review
+    title: "코드 리뷰"
+    description: "구현과 테스트 결과를 검토하고 최종 승인한다."
+    model_tier: opus
+    timeout_minutes: 20
+    priority: 4
+    depends_on: [test]
+    acceptance_criteria:
+      - "모든 수락 기준이 PASS"
+      - "코드 품질 기준 충족"
