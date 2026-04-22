@@ -89,7 +89,8 @@ class TaskInstruction(BaseModel):
 class TaskReport(BaseModel):
     task_id: str
     status: TaskStatus
-    deliverables: list[str] = []
+    files: list[dict[str, str]] = []       # [{"path": "...", "content": "..."}]
+    deliverables: list[str] = []            # relative paths of written files
     evidence: dict[str, Any] = {}
     summary: str
     tokens_used: int = 0

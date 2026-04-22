@@ -202,7 +202,10 @@ async def dispatch_workers_node(state: AgentForgeState) -> dict[str, Any]:
         dag_index[tid] = TaskStatus.RUNNING
 
         worker = WorkerAgent(model_tier=node.instruction.model_tier)
-        report = await worker.execute(node.instruction)
+        report = await worker.execute(
+            node.instruction,
+            workspace_root=state.get("workspace_root"),
+        )
         return tid, report
 
     results = await asyncio.gather(*[run_task(tid) for tid in ready_ids])
@@ -251,7 +254,10 @@ async def verify_ci_node(state: AgentForgeState) -> dict[str, Any]:
 
     from agentforge.verification.ci_layer import CIVerifier
     verifier = CIVerifier()
-    result = await verifier.verify(node.instruction, node.report)
+    result = await verifier.verify(
+        node.instruction, node.report,
+        workspace_root=state.get("workspace_root"),
+    )
 
     return {
         "ci_passed": result.passed,
@@ -386,17 +392,28 @@ async def finalize_node(state: AgentForgeState) -> dict[str, Any]:
     dag_index = state.get("dag_index", {})
     summaries = state.get("completed_summaries", [])
     escalations = state.get("escalation_history", [])
+    workspace_root = state.get("workspace_root", "")
 
     completed = sum(1 for s in dag_index.values() if s == TaskStatus.COMPLETED)
     total = len(dag_index)
     failed = sum(1 for s in dag_index.values() if s == TaskStatus.FAILED)
 
-    report = (
-        f"✅ 작업 완료\n"
-        f"완료: {completed}/{total}  실패: {failed}  에스컬레이션: {len(escalations)}회\n\n"
-        + "\n".join(summaries)
-    )
-    return {"final_report": report}
+    lines = [
+        f"작업 완료",
+        f"완료: {completed}/{total}  실패: {failed}  에스컬레이션: {len(escalations)}회",
+    ]
+    if summaries:
+        lines += ["", "산출물 요약:"] + [f"  - {s}" for s in summaries]
+    if workspace_root:
+        from agentforge.workspace.manager import WorkspaceManager
+        from pathlib import Path
+        ws = WorkspaceManager(Path(workspace_root).name)
+        ws.root = Path(workspace_root)
+        git_log = ws.git_log(n=5)
+        if git_log:
+            lines += ["", f"작업 디렉토리: `{workspace_root}`", "최근 커밋:", f"```\n{git_log}\n```"]
+
+    return {"final_report": "\n".join(lines)}
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -10,6 +11,7 @@ from typing import Optional
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 load_dotenv()
@@ -89,6 +91,30 @@ def _ensure_dirs() -> None:
         Path(d).mkdir(parents=True, exist_ok=True)
 
 
+def _open_db() -> Optional[sqlite3.Connection]:
+    db_path = os.getenv("AF_DB_PATH", "agentforge.db")
+    if not Path(db_path).exists():
+        console.print("[yellow]데이터베이스 없음 — 실행된 세션이 없습니다.[/yellow]")
+        return None
+    try:
+        return sqlite3.connect(db_path)
+    except Exception as exc:
+        console.print(f"[red]DB 오류: {exc}[/red]")
+        return None
+
+
+def _decode_metadata(raw: bytes | str | None) -> dict:
+    """Decode LangGraph checkpoint metadata (JSON bytes or str)."""
+    if not raw:
+        return {}
+    try:
+        if isinstance(raw, (bytes, bytearray)):
+            return json.loads(raw.decode())
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
 @app.command()
 def start(
     mock: bool = typer.Option(False, "--mock", help="Mock mode (no API calls)"),
@@ -108,7 +134,6 @@ def start(
         console.print("[green]OK 준비 완료 (mock)[/green]")
         return
 
-    # Real mode: start Slack bot
     from agentforge.interfaces.slack_interface import SlackInterface
 
     iface = SlackInterface()
@@ -125,35 +150,202 @@ def start(
 
 @app.command()
 def status() -> None:
-    """Show active sessions from the checkpoint database."""
-    db_path = os.getenv("AF_DB_PATH", "agentforge.db")
-    if not Path(db_path).exists():
-        console.print("[yellow]데이터베이스 없음 — 실행된 세션이 없습니다.[/yellow]")
+    """List all sessions with step count and latest checkpoint."""
+    conn = _open_db()
+    if conn is None:
         return
 
     try:
-        conn = sqlite3.connect(db_path)
         cur = conn.cursor()
+        # One row per session: checkpoint count and latest checkpoint_id
         cur.execute(
-            "SELECT thread_id, checkpoint_ns, checkpoint_id FROM checkpoints ORDER BY rowid DESC LIMIT 20"
+            """
+            SELECT
+                thread_id,
+                COUNT(*) AS steps,
+                MAX(checkpoint_id) AS latest_checkpoint,
+                MAX(rowid) AS last_rowid
+            FROM checkpoints
+            GROUP BY thread_id
+            ORDER BY last_rowid DESC
+            LIMIT 50
+            """
         )
         rows = cur.fetchall()
+
+        # Fetch metadata for the latest checkpoint of each session
+        session_meta: dict[str, dict] = {}
+        for thread_id, _steps, latest_cp, _rowid in rows:
+            cur.execute(
+                "SELECT metadata FROM checkpoints WHERE thread_id=? AND checkpoint_id=?",
+                (thread_id, latest_cp),
+            )
+            row = cur.fetchone()
+            session_meta[thread_id] = _decode_metadata(row[0] if row else None)
+
+    finally:
         conn.close()
-    except Exception as exc:
-        console.print(f"[red]DB 오류: {exc}[/red]")
-        return
 
     if not rows:
         console.print("[yellow]저장된 세션 없음[/yellow]")
         return
 
-    table = Table(title="AgentForge 세션")
-    table.add_column("Session ID", style="cyan")
-    table.add_column("Namespace")
-    table.add_column("Checkpoint ID", style="dim")
-    for row in rows:
-        table.add_row(*[str(v) for v in row])
+    table = Table(title="AgentForge 세션 목록", show_lines=True)
+    table.add_column("Session ID", style="cyan", no_wrap=True)
+    table.add_column("Steps", justify="right")
+    table.add_column("마지막 노드", style="green")
+    table.add_column("에스컬레이션", justify="right")
+    table.add_column("Latest Checkpoint", style="dim")
+
+    for thread_id, steps, latest_cp, _rowid in rows:
+        meta = session_meta.get(thread_id, {})
+        last_node = meta.get("source", "") or "-"
+        writes = meta.get("writes") or {}
+        esc_level = "-"
+        if isinstance(writes, dict):
+            for node_data in writes.values():
+                if isinstance(node_data, dict) and "current_escalation_level" in node_data:
+                    esc_level = str(node_data["current_escalation_level"])
+                    break
+
+        table.add_row(
+            thread_id,
+            str(steps),
+            last_node,
+            esc_level,
+            latest_cp[:36] if latest_cp else "-",
+        )
+
     console.print(table)
+    console.print(
+        f"\n[dim]상세 조회: agentforge session <SESSION_ID>[/dim]\n"
+        f"[dim]세션 삭제: agentforge kill <SESSION_ID>[/dim]"
+    )
+
+
+@app.command()
+def session(
+    session_id: str = typer.Argument(..., help="Session ID (prefix OK)"),
+) -> None:
+    """Show detailed checkpoint history for a session."""
+    conn = _open_db()
+    if conn is None:
+        return
+
+    try:
+        cur = conn.cursor()
+        # Support prefix matching
+        cur.execute(
+            """
+            SELECT checkpoint_id, parent_checkpoint_id, metadata
+            FROM checkpoints
+            WHERE thread_id LIKE ?
+            ORDER BY rowid ASC
+            """,
+            (f"{session_id}%",),
+        )
+        rows = cur.fetchall()
+
+        # Resolve full thread_id from prefix
+        cur.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE ?",
+            (f"{session_id}%",),
+        )
+        thread_ids = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    if not rows:
+        console.print(f"[red]세션을 찾을 수 없습니다: {session_id}[/red]")
+        raise typer.Exit(1)
+
+    if len(thread_ids) > 1:
+        console.print(f"[yellow]여러 세션이 매칭됩니다. 더 긴 ID를 입력하세요:[/yellow]")
+        for tid in thread_ids:
+            console.print(f"  {tid}")
+        raise typer.Exit(1)
+
+    full_id = thread_ids[0]
+    console.print(Panel(f"[bold cyan]{full_id}[/bold cyan]", title="세션 상세"))
+
+    table = Table(show_lines=True)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Checkpoint ID", style="dim")
+    table.add_column("Source")
+    table.add_column("Step", justify="right")
+    table.add_column("Writes (nodes)")
+
+    for i, (cp_id, parent_id, raw_meta) in enumerate(rows, 1):
+        meta = _decode_metadata(raw_meta)
+        source = meta.get("source", "-")
+        step = str(meta.get("step", "-"))
+        writes = meta.get("writes") or {}
+        write_nodes = ", ".join(writes.keys()) if isinstance(writes, dict) else "-"
+        table.add_row(str(i), cp_id[:36] if cp_id else "-", source, step, write_nodes or "-")
+
+    console.print(table)
+    console.print(f"\n총 체크포인트: [bold]{len(rows)}[/bold]")
+
+
+@app.command()
+def kill(
+    session_id: str = typer.Argument(..., help="Session ID (prefix OK)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Delete a session and all its checkpoints from the database."""
+    conn = _open_db()
+    if conn is None:
+        return
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints WHERE thread_id LIKE ?",
+            (f"{session_id}%",),
+        )
+        thread_ids = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    if not thread_ids:
+        console.print(f"[red]세션을 찾을 수 없습니다: {session_id}[/red]")
+        raise typer.Exit(1)
+
+    if len(thread_ids) > 1:
+        console.print("[yellow]여러 세션이 매칭됩니다. 더 긴 ID를 입력하세요:[/yellow]")
+        for tid in thread_ids:
+            console.print(f"  {tid}")
+        raise typer.Exit(1)
+
+    full_id = thread_ids[0]
+
+    if not yes:
+        confirm = typer.confirm(f"세션 '{full_id}' 을(를) 삭제하시겠습니까?")
+        if not confirm:
+            console.print("[yellow]취소됨[/yellow]")
+            raise typer.Exit(0)
+
+    conn = _open_db()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM checkpoints WHERE thread_id=?", (full_id,))
+        deleted_cp = cur.rowcount
+        # writes table (LangGraph SQLite secondary table)
+        try:
+            cur.execute("DELETE FROM writes WHERE thread_id=?", (full_id,))
+            deleted_wr = cur.rowcount
+        except sqlite3.OperationalError:
+            deleted_wr = 0
+        conn.commit()
+    finally:
+        conn.close()
+
+    console.print(
+        f"[green]삭제 완료[/green] — "
+        f"체크포인트 {deleted_cp}개, 쓰기 레코드 {deleted_wr}개 제거됨"
+    )
 
 
 @app.command()
@@ -164,29 +356,27 @@ def resume(
     """Resume a paused (L4) session from its checkpoint."""
     _ensure_agents_md()
 
-    from agentforge.core.checkpoint import get_checkpointer
-    from agentforge.core.state import AgentForgeState
+    from agentforge.core.checkpoint import init_checkpointer
     from langgraph.types import Command
     from workflows.builder import GraphBuilder
 
     console.print(f"[cyan]세션 재개:[/cyan] {session_id}")
 
-    checkpointer = get_checkpointer()
-    config = {"configurable": {"thread_id": session_id}}
-    state = checkpointer.get(config)
-
-    if state is None:
-        console.print(f"[red]세션을 찾을 수 없습니다: {session_id}[/red]")
-        raise typer.Exit(1)
-
-    workflow_spec = state.get("workflow_spec")
-    if workflow_spec is None:
-        console.print("[red]워크플로우 스펙 없음 — 재개 불가[/red]")
-        raise typer.Exit(1)
-
-    graph = GraphBuilder().from_spec(workflow_spec)
-
     async def _run() -> None:
+        checkpointer = await init_checkpointer()
+        config = {"configurable": {"thread_id": session_id}}
+        state = await checkpointer.aget(config)
+
+        if state is None:
+            console.print(f"[red]세션을 찾을 수 없습니다: {session_id}[/red]")
+            raise typer.Exit(1)
+
+        workflow_spec = state.get("workflow_spec")
+        if workflow_spec is None:
+            console.print("[red]워크플로우 스펙 없음 — 재개 불가[/red]")
+            raise typer.Exit(1)
+
+        graph = GraphBuilder().from_spec(workflow_spec)
         async for event in graph.astream_events(
             Command(resume=user_choice), config=config, version="v2"
         ):

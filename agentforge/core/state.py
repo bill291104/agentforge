@@ -15,9 +15,13 @@ from agentforge.core.models import (
 
 
 def make_initial_state(session_id: str, user_request: str) -> "AgentForgeState":
+    from agentforge.workspace.manager import WorkspaceManager
+    ws = WorkspaceManager(session_id)
+    ws.init()
     return AgentForgeState(
         session_id=session_id,
         user_request=user_request,
+        workspace_root=str(ws.root),
         workflow_spec=None,
         task_nodes={},
         dag_index={},
@@ -41,6 +45,7 @@ class AgentForgeState(TypedDict):
     # Session identity
     session_id: str
     user_request: str
+    workspace_root: str
 
     # Workflow
     workflow_spec: Optional[WorkflowSpec]

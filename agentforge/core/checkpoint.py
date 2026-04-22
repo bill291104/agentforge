@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from pathlib import Path
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 _DB_PATH = str(Path(os.getenv("AF_DB_PATH", "agentforge.db")))
-_saver: SqliteSaver | None = None
+_saver: AsyncSqliteSaver | None = None
 
 
-def get_checkpointer() -> SqliteSaver:
-    """Return a singleton SqliteSaver for session persistence."""
+async def init_checkpointer() -> AsyncSqliteSaver:
+    """Open the SQLite connection and set up the global checkpointer.
+    Must be called once before get_checkpointer() is used."""
     global _saver
     if _saver is None:
-        conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        _saver = SqliteSaver(conn)
+        conn = await aiosqlite.connect(_DB_PATH)
+        _saver = AsyncSqliteSaver(conn)
+        await _saver.setup()
+    return _saver
+
+
+def get_checkpointer() -> AsyncSqliteSaver:
+    """Return the already-initialized checkpointer. Call init_checkpointer() first."""
+    if _saver is None:
+        raise RuntimeError("Checkpointer not initialized. Call init_checkpointer() first.")
     return _saver
