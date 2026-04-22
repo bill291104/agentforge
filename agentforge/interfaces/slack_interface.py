@@ -95,6 +95,14 @@ class SlackInterface(BaseInterface):
             blocks=blocks,
         )
 
+    def _on_task_done(self, task: "asyncio.Task") -> None:
+        """Log exceptions from background asyncio tasks so they don't vanish silently."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.exception("Background task failed: %s", exc, exc_info=exc)
+
     # ------------------------------------------------------------------
     # Graph streaming
     # ------------------------------------------------------------------
@@ -122,13 +130,15 @@ class SlackInterface(BaseInterface):
             else:
                 await self.update_message(channel, status_ts, text)
 
+        logger.info("Graph streaming started: session=%s channel=%s", session_id, channel)
         try:
             async for event in graph.astream_events(initial_state, config=config, version="v2"):
                 event_name = event.get("event", "")
                 node_name = event.get("name", "")
 
                 if event_name == "on_chain_start" and node_name not in ("", "LangGraph"):
-                    await _post_or_update(f"⚙️ `{node_name}` 실행 중...")
+                    logger.info("[%s] node start: %s", session_id[:8], node_name)
+                    await _post_or_update(f"`{node_name}` 실행 중...")
 
                 elif event_name == "on_chain_end" and node_name == "interrupt_l4":
                     # L4 interrupt: graph paused, send buttons
@@ -181,96 +191,37 @@ class SlackInterface(BaseInterface):
         channel: str = event.get("channel", "")
         thread_ts: str = event.get("thread_ts") or event.get("ts", "")
 
+        logger.info("Mention received from %s in %s: %.80s", user_id, channel, text)
+
         # Strip bot mention prefix <@BOTID>
         request = text.split(">", 1)[-1].strip() if ">" in text else text.strip()
         if not request:
             await say(text="요청 내용을 입력해 주세요.", thread_ts=thread_ts)
             return
 
-        # Complaint detection — fire and forget
+        # Immediate acknowledgment — user sees a response right away
+        await say(text=f"요청을 받았습니다. 처리를 시작합니다...\n세션 ID: `{str(uuid.uuid4())[:8]}`", thread_ts=thread_ts)
+
+        # Complaint detection
         if any(kw in request for kw in self.COMPLAINT_KEYWORDS):
             asyncio.create_task(self._handle_complaint(user_id, request, channel, thread_ts))
 
-        # Build initial state and launch graph
+        # Build graph and initial state
+        from agentforge.core.models import WorkflowSpec
         from agentforge.core.state import make_initial_state
         from workflows.builder import GraphBuilder
 
         session_id = str(uuid.uuid4())
         state = make_initial_state(session_id=session_id, user_request=request)
-        graph = GraphBuilder().from_spec(state["workflow_spec"]) if state.get("workflow_spec") else None
+        # GraphBuilder.from_spec already starts at refine_requirements;
+        # pass an empty spec so it uses the full pipeline without a pre-built DAG.
+        graph = GraphBuilder().from_spec(WorkflowSpec(name="pipeline", tasks=[]))
 
-        if graph is None:
-            # No pre-built spec — use refine_requirements path
-            from agentforge.graph.nodes import _is_mock
-            from agentforge.core.models import WorkflowSpec
-            state["workflow_spec"] = None
-
-            # Build a minimal graph that starts at refine_requirements
-            from agentforge.graph.nodes import (
-                refine_requirements_node, build_dag_node,
-                check_context_node, compress_context_node,
-                spawn_sub_orchestrator_node, dispatch_workers_node,
-                verify_ci_node, verify_semantic_node,
-                escalate_node, interrupt_l4_node, finalize_node,
-            )
-            from agentforge.graph.edges import (
-                route_context, route_after_verify_ci,
-                route_after_verify_semantic, route_after_escalate,
-            )
-            from langgraph.graph import StateGraph, END
-            from agentforge.core.state import AgentForgeState
-            from agentforge.core.checkpoint import get_checkpointer
-
-            g = StateGraph(AgentForgeState)
-            for name, fn in [
-                ("refine_requirements", refine_requirements_node),
-                ("build_dag", build_dag_node),
-                ("check_context", check_context_node),
-                ("compress_context", compress_context_node),
-                ("spawn_sub_orchestrator", spawn_sub_orchestrator_node),
-                ("dispatch_workers", dispatch_workers_node),
-                ("verify_ci", verify_ci_node),
-                ("verify_semantic", verify_semantic_node),
-                ("escalate", escalate_node),
-                ("interrupt_l4", interrupt_l4_node),
-                ("finalize", finalize_node),
-            ]:
-                g.add_node(name, fn)
-
-            g.set_entry_point("refine_requirements")
-            g.add_edge("refine_requirements", "build_dag")
-            g.add_edge("build_dag", "check_context")
-            g.add_conditional_edges("check_context", route_context, {
-                "dispatch_workers": "dispatch_workers",
-                "compress_context": "compress_context",
-                "spawn_sub_orchestrator": "spawn_sub_orchestrator",
-            })
-            g.add_edge("compress_context", "dispatch_workers")
-            g.add_edge("spawn_sub_orchestrator", "dispatch_workers")
-            g.add_edge("dispatch_workers", "verify_ci")
-            g.add_conditional_edges("verify_ci", route_after_verify_ci, {
-                "verify_semantic": "verify_semantic",
-                "escalate": "escalate",
-            })
-            g.add_conditional_edges("verify_semantic", route_after_verify_semantic, {
-                "finalize": "finalize",
-                "check_context": "check_context",
-                "escalate": "escalate",
-            })
-            g.add_conditional_edges("escalate", route_after_escalate, {
-                "dispatch_workers": "dispatch_workers",
-                "interrupt_l4": "interrupt_l4",
-            })
-            g.add_edge("interrupt_l4", END)
-            g.add_edge("finalize", END)
-            graph = g.compile(
-                checkpointer=get_checkpointer(),
-                interrupt_before=["interrupt_l4"],
-            )
-
-        asyncio.create_task(
+        task = asyncio.create_task(
             self.stream_graph_to_slack(graph, state, channel, thread_ts, session_id)
         )
+        # Log unhandled exceptions from the background task
+        task.add_done_callback(self._on_task_done)
 
     async def _on_l4_action(self, body: dict, resume_value: str) -> None:
         """Handle Block Kit button press for L4 escalation."""

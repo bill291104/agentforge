@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -15,6 +16,15 @@ load_dotenv()
 
 app = typer.Typer(help="AgentForge - Agent-based development team orchestrator")
 console = Console()
+
+
+def _configure_logging() -> None:
+    level = os.getenv("AF_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 _AGENTS_MD = Path("AGENTS.md")
 _AGENTS_MD_CONTENT = """\
@@ -88,6 +98,7 @@ def start(
     if mock:
         os.environ["AF_MOCK_MODE"] = "true"
 
+    _configure_logging()
     _ensure_agents_md()
     _ensure_dirs()
     console.print("[bold cyan]AgentForge[/bold cyan] 시작 중...")
