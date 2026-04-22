@@ -15,6 +15,44 @@ _MOCK = os.getenv("AF_MOCK_MODE", "false").lower() == "true"
 _CONFIRM_KEYWORDS = {"네", "예", "yes", "y", "진행", "ㅇㅇ", "ok", "확인", "go", "그래"}
 _CANCEL_KEYWORDS  = {"아니오", "아니", "no", "n", "취소", "cancel", "그만", "중단"}
 
+# Tools the LLM can call when responding to a mention in a completed thread
+_COMPLETED_THREAD_TOOLS = [
+    {
+        "name": "start_new_task",
+        "description": (
+            "이전 작업을 재시작하거나 수정된 요구사항으로 새 작업을 시작합니다. "
+            "사용자가 다시 시도하거나, 수정/개선을 원하거나, 새 기능을 추가하고 싶을 때 사용합니다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "description": "새 작업 요청 내용. 비어 있으면 이전 요구사항을 그대로 사용합니다.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "answer_question",
+        "description": (
+            "완료(또는 실패)된 세션에 대한 질문에 답합니다. "
+            "실패 원인 분석, 결과 설명, 개선 방안 제안, 진행 상황 문의 등에 사용합니다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "answer": {
+                    "type": "string",
+                    "description": "사용자 질문에 대한 답변 (마크다운 허용).",
+                }
+            },
+            "required": ["answer"],
+        },
+    },
+]
+
 
 class SlackInterface(BaseInterface):
     """
@@ -351,24 +389,24 @@ class SlackInterface(BaseInterface):
                 )
                 return
             if stage == "completed":
-                # Answer follow-up questions about the completed session
+                # Let the LLM decide the action via tool calling
                 if request:
                     task = asyncio.create_task(
-                        self._handle_followup_question(
-                            self._app.client, existing, request, channel, thread_ts
+                        self._dispatch_completed_thread(
+                            self._app.client, existing, request, channel, thread_ts, user_id
                         )
                     )
                     task.add_done_callback(self._on_task_done)
                 return
-            # stage == "clarifying" | "confirming"
-            if request:
-                task = asyncio.create_task(
-                    self._handle_clarification_reply(
-                        self._app.client, channel, thread_ts, request
+            elif stage in ("clarifying", "confirming"):
+                if request:
+                    task = asyncio.create_task(
+                        self._handle_clarification_reply(
+                            self._app.client, channel, thread_ts, request
+                        )
                     )
-                )
-                task.add_done_callback(self._on_task_done)
-            return
+                    task.add_done_callback(self._on_task_done)
+                return
 
         if not request:
             await say(text="요청 내용을 입력해 주세요.", thread_ts=thread_ts)
@@ -681,18 +719,23 @@ class SlackInterface(BaseInterface):
             await self._persist(thread_ts)
 
     # ------------------------------------------------------------------
-    # Follow-up Q&A on completed sessions
+    # Completed-thread dispatcher (tool calling)
     # ------------------------------------------------------------------
 
-    async def _handle_followup_question(
+    async def _dispatch_completed_thread(
         self,
         client: Any,
         state: dict,
-        question: str,
+        user_message: str,
         channel: str,
         thread_ts: str,
+        user_id: str,
     ) -> None:
-        """Answer a follow-up question about a completed session using Slack thread history."""
+        """
+        Use tool calling so the LLM can choose between:
+          - start_new_task  : restart or modify the task
+          - answer_question : explain results, analyse failure, etc.
+        """
         original_request = state.get("request", "")
         final_report     = state.get("summary", "")
         session_id       = state.get("session_id", "")
@@ -701,9 +744,10 @@ class SlackInterface(BaseInterface):
 
         context = (
             f"## 원래 요청\n{original_request}\n\n"
-            f"## 최종 작업 보고서 (세션 {session_id[:8]})\n{final_report}\n\n"
+            f"## 최종 작업 보고서 (세션 {session_id[:8] if session_id else '?'})\n"
+            f"{final_report}\n\n"
             f"## 스레드 대화 내역\n{thread_text}\n\n"
-            f"## 사용자 질문\n{question}"
+            f"## 사용자 메시지\n{user_message}"
         )
 
         try:
@@ -714,24 +758,65 @@ class SlackInterface(BaseInterface):
             response = await ai.messages.create(
                 model=MODEL_IDS[ModelTier.SONNET],
                 max_tokens=1024,
+                tools=_COMPLETED_THREAD_TOOLS,
                 system=(
-                    "당신은 AgentForge AI 시스템의 어시스턴트입니다.\n"
-                    "제공된 작업 보고서와 스레드 대화 내역을 바탕으로 사용자의 질문에 답하세요.\n"
-                    "실패 원인을 구체적으로 분석하고 개선 방안도 함께 제안하세요.\n"
-                    "작업 보고서에 없는 내용은 추측하지 말고 '확인이 필요합니다'라고 답하세요."
+                    "당신은 AgentForge 소프트웨어 개발 AI 시스템의 어시스턴트입니다.\n"
+                    "제공된 작업 보고서와 스레드 대화 내역을 보고, 사용자 메시지의 의도에 맞는 도구를 선택하세요.\n"
+                    "- 작업 재시작/재시도/수정/개선 요청 → start_new_task\n"
+                    "- 결과 설명, 실패 원인 분석, 상태 확인 등 질문 → answer_question\n"
+                    "반드시 도구를 호출하세요. 텍스트 응답만 하지 마세요."
                 ),
                 messages=[{"role": "user", "content": context}],
             )
-            answer = response.content[0].text
-            await client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=answer
-            )
         except Exception as exc:
-            logger.exception("Follow-up question error: %s", exc)
+            logger.exception("Dispatch completed thread error: %s", exc)
             await client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f"질문 처리 중 오류가 발생했습니다: {exc}"
+                text=f"요청 처리 중 오류가 발생했습니다: {exc}"
             )
+            return
+
+        # Process tool call
+        tool_use_block = next(
+            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
+            None,
+        )
+
+        if tool_use_block is None:
+            # Model returned text without calling a tool — show it as-is
+            text = " ".join(
+                getattr(b, "text", "") for b in response.content
+                if getattr(b, "type", None) == "text"
+            ).strip()
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text or "처리할 수 없습니다.")
+            return
+
+        tool_name  = tool_use_block.name
+        tool_input = tool_use_block.input or {}
+        logger.info("Completed-thread tool selected: %s (thread=%s)", tool_name, thread_ts[:12])
+
+        if tool_name == "start_new_task":
+            new_request = tool_input.get("request", "").strip() or original_request
+            await self._delete_thread(thread_ts)
+            # Synthesize a fresh mention event by directly starting clarification
+            fresh_state: dict = {
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "user_id": user_id,
+                "request": new_request,
+                "history": [{"role": "user", "content": new_request}],
+                "stage": "clarifying",
+                "summary": None,
+                "session_id": None,
+                "task_id": None,
+            }
+            self._pending_clarification[thread_ts] = fresh_state
+            await self._persist(thread_ts)
+            await self._run_clarification_turn(client, channel, thread_ts)
+
+        elif tool_name == "answer_question":
+            answer = tool_input.get("answer", "답변을 생성할 수 없습니다.")
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
 
     async def _fetch_thread_messages(
         self, client: Any, channel: str, thread_ts: str, limit: int = 30
