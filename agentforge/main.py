@@ -20,13 +20,26 @@ app = typer.Typer(help="AgentForge - Agent-based development team orchestrator")
 console = Console()
 
 
-def _configure_logging() -> None:
-    level = os.getenv("AF_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+def _configure_logging(debug: bool = False) -> None:
+    level_name = "DEBUG" if debug else os.getenv("AF_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%H:%M:%S"
+
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+    if debug:
+        from datetime import date
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"agentforge_{date.today():%Y%m%d}.log"
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        handlers.append(fh)
+        console.print(f"[dim]Debug 로그 파일: {log_file}[/dim]")
+
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
 
 _AGENTS_MD = Path("AGENTS.md")
 _AGENTS_MD_CONTENT = """\
@@ -117,14 +130,17 @@ def _decode_metadata(raw: bytes | str | None) -> dict:
 
 @app.command()
 def start(
-    mock: bool = typer.Option(False, "--mock", help="Mock mode (no API calls)"),
-    port: int = typer.Option(3000, "--port", help="Health-check HTTP port"),
+    mock: bool  = typer.Option(False, "--mock",  help="Mock mode (no API calls)"),
+    debug: bool = typer.Option(False, "--debug", help="Debug logging to logs/ directory"),
+    port: int   = typer.Option(3000, "--port",   help="Health-check HTTP port"),
 ) -> None:
     """Start the AgentForge Slack bot."""
     if mock:
         os.environ["AF_MOCK_MODE"] = "true"
+    if debug:
+        os.environ["AF_LOG_LEVEL"] = "DEBUG"
 
-    _configure_logging()
+    _configure_logging(debug=debug)
     _ensure_agents_md()
     _ensure_dirs()
     console.print("[bold cyan]AgentForge[/bold cyan] 시작 중...")

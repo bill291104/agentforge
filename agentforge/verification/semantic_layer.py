@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 from agentforge.core.models import (
@@ -10,7 +11,10 @@ from agentforge.core.models import (
     SemanticResult,
     TaskInstruction,
     TaskReport,
+    TaskStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
 [VERIFICATION MODE - EFFORT: XHIGH]
@@ -41,10 +45,25 @@ class SemanticVerifier:
             criteria_results = {c: "PASS" for c in instruction.acceptance_criteria}
             return SemanticResult(verdict="ACCEPT", criteria_results=criteria_results)
 
+        # Fast-path reject: worker already declared failure
+        if report.status in (TaskStatus.FAILED, TaskStatus.TIMEOUT):
+            logger.info(
+                "Semantic fast-reject: worker status=%s summary=%.120s",
+                report.status, report.summary,
+            )
+            return SemanticResult(
+                verdict="REJECT",
+                criteria_results={c: "FAIL" for c in instruction.acceptance_criteria},
+                rejection_reason=f"워커가 실패를 선언함: {report.summary[:200]}",
+                suggested_fix="워커 실패 원인을 분석하고 태스크를 더 작은 단위로 분리하거나 모델 티어를 올리세요.",
+            )
+
         import anthropic
 
         client = anthropic.AsyncAnthropic()
         prompt = _build_prompt(instruction, report, ci_result)
+
+        logger.debug("Semantic verify prompt:\n%s", prompt[:800])
 
         response = await client.messages.create(
             model=self._model,
@@ -53,7 +72,14 @@ class SemanticVerifier:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        return _parse_response(raw, instruction)
+        logger.debug("Semantic raw response: %s", raw[:500])
+
+        result = _parse_response(raw, instruction)
+        logger.info(
+            "Semantic verdict=%s reason=%.120s",
+            result.verdict, result.rejection_reason or "",
+        )
+        return result
 
 
 def _build_prompt(
@@ -67,7 +93,8 @@ def _build_prompt(
         + "\n".join(f"- {c}" for c in instruction.acceptance_criteria)
         + f"\n\n### CI 검증 결과\n"
         f"통과: {ci_result.passed}\n"
-        f"자동 확인됨: {ci_result.auto_verified}\n\n"
+        f"자동 확인됨: {ci_result.auto_verified}\n"
+        f"실패 항목: {ci_result.failed_criteria}\n\n"
         f"### 워커 보고서\n"
         f"상태: {report.status}\n"
         f"요약: {report.summary}\n"
@@ -78,20 +105,29 @@ def _build_prompt(
 
 
 def _parse_response(raw: str, instruction: TaskInstruction) -> SemanticResult:
+    text = raw
     try:
-        # Extract JSON block if wrapped in markdown
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        data = json.loads(raw.strip())
+        if "```" in text:
+            parts = text.split("```")
+            for part in parts[1::2]:
+                candidate = part.lstrip("json").strip()
+                try:
+                    data = json.loads(candidate)
+                    return SemanticResult.model_validate(data)
+                except (json.JSONDecodeError, Exception):
+                    continue
+            raise ValueError("JSON 블록을 찾을 수 없음")
+        data = json.loads(text.strip())
         return SemanticResult.model_validate(data)
-    except Exception:
-        # Fallback: accept with warning
+    except Exception as exc:
+        # Parsing failed → conservative REJECT (not ACCEPT)
+        # An unparseable response means we cannot confirm acceptance.
+        logger.warning("Semantic parse failed (%s) — defaulting to REJECT. raw=%.200s", exc, raw)
         return SemanticResult(
-            verdict="ACCEPT",
-            criteria_results={c: "PASS" for c in instruction.acceptance_criteria},
-            rejection_reason="파싱 실패 — 수동 검토 필요",
+            verdict="REJECT",
+            criteria_results={c: "FAIL" for c in instruction.acceptance_criteria},
+            rejection_reason=f"검증 응답 파싱 실패: {exc}",
+            suggested_fix="검증을 재시도하거나 수동으로 결과를 확인하세요.",
         )
 
 

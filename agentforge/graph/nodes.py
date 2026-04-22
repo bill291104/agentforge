@@ -223,6 +223,10 @@ async def dispatch_workers_node(state: AgentForgeState) -> dict[str, Any]:
         })
         task_nodes[tid] = node
         dag_index[tid] = new_status
+        logger.info(
+            "[dispatch] task=%s status=%s attempt=%d summary=%.100s",
+            tid, new_status, node.attempt_count + 1, report.summary,
+        )
         if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             completed_task_id = tid  # last one for verify step
 
@@ -307,6 +311,8 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
     node = task_nodes[task_id]
     level = node.escalation_level
 
+    logger.info("[escalate] task=%s level=%s", task_id, level)
+
     if level == EscalationLevel.L0:
         # Retry same agent with rejection notice
         new_level = EscalationLevel.L1
@@ -315,6 +321,7 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
             "status": TaskStatus.PENDING,
             "report": None,
         })
+        logger.info("[escalate] L0→L1: retry same agent task=%s", task_id)
     elif level == EscalationLevel.L1:
         # Spawn new agent of same tier
         new_level = EscalationLevel.L2
@@ -324,6 +331,7 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
             "assigned_agent_id": None,
             "report": None,
         })
+        logger.info("[escalate] L1→L2: spawn new agent task=%s", task_id)
     elif level == EscalationLevel.L2:
         # Upgrade model tier
         upgraded_tier = _upgrade_tier(node.instruction.model_tier)
@@ -335,14 +343,20 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
             "report": None,
         })
         new_level = EscalationLevel.L3
+        logger.info(
+            "[escalate] L2→L3: upgrade tier %s→%s task=%s",
+            node.instruction.model_tier, upgraded_tier, task_id,
+        )
     elif level == EscalationLevel.L3:
         # Stop task, block dependents, continue rest
         node = node.model_copy(update={"status": TaskStatus.FAILED})
         dag_index[task_id] = TaskStatus.FAILED
         _cascade_block(task_id, task_nodes, dag_index)
         new_level = EscalationLevel.L4
+        logger.warning("[escalate] L3→L4: task permanently failed task=%s", task_id)
     else:
         new_level = EscalationLevel.L4
+        logger.warning("[escalate] L4+: already at max escalation task=%s", task_id)
 
     task_nodes[task_id] = node
     history.append({

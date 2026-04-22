@@ -4,7 +4,7 @@ import logging
 import os
 from pathlib import Path
 
-from agentforge.core.models import CIResult, TaskInstruction, TaskReport
+from agentforge.core.models import CIResult, TaskInstruction, TaskReport, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,13 @@ class CIVerifier:
 
         # 1. Schema — report is always a valid TaskReport
         verified.append("report_schema_valid")
+
+        # 2. Immediate fail if worker declared failure or timeout
+        if report.status in (TaskStatus.FAILED, TaskStatus.TIMEOUT):
+            reason = f"worker_status:{report.status.value}"
+            failed.append(reason)
+            logger.info("CI fail — %s  summary=%.120s", reason, report.summary)
+            return CIResult(passed=False, failed_criteria=failed, auto_verified=verified)
 
         # 2. Deliverable files exist in workspace
         for rel_path in report.deliverables:

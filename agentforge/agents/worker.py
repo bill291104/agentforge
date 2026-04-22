@@ -62,7 +62,15 @@ class WorkerAgent(BaseAgent):
         duration = time.monotonic() - start
         tokens = response.usage.input_tokens + response.usage.output_tokens
         raw = response.content[0].text
+        logger.debug(
+            "[worker:%s] raw response (%d chars):\n%s",
+            instruction.task_id, len(raw), raw[:2000],
+        )
         report = _parse_report(instruction, raw, tokens, duration)
+        logger.info(
+            "[worker:%s] status=%s tokens=%d duration=%.1fs summary=%.100s",
+            instruction.task_id, report.status, tokens, duration, report.summary,
+        )
 
         # Write files to workspace and commit
         if workspace_root and report.status == TaskStatus.COMPLETED:
