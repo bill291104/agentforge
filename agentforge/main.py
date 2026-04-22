@@ -29,7 +29,9 @@ def _configure_logging(debug: bool = False) -> None:
 
     handlers: list[logging.Handler] = [logging.StreamHandler()]
 
-    if debug:
+    # File logging activates whenever the effective level is DEBUG,
+    # whether via --debug flag or AF_LOG_LEVEL=DEBUG in .env
+    if level == logging.DEBUG:
         from datetime import date
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
