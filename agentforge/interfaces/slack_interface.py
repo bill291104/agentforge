@@ -156,9 +156,8 @@ class SlackInterface(BaseInterface):
             channel    = state.get("channel", "")
             session_id = state.get("session_id")
 
-            if stage in ("clarifying", "confirming"):
-                # These are self-contained — they will resume naturally
-                # when the user sends the next message in the thread.
+            if stage in ("clarifying", "confirming", "completed"):
+                # Self-contained — resumes naturally when user sends next message.
                 logger.info("Thread %s restored (stage=%s)", thread_ts[:12], stage)
 
             elif stage == "running" and session_id:
@@ -335,7 +334,7 @@ class SlackInterface(BaseInterface):
 
         existing = self._pending_clarification.get(thread_ts)
 
-        # Mention inside an existing clarification thread → forward to reply handler
+        # Mention inside an existing thread — route by stage
         if existing:
             stage = existing.get("stage", "")
             if stage == "running":
@@ -351,6 +350,17 @@ class SlackInterface(BaseInterface):
                     thread_ts=thread_ts,
                 )
                 return
+            if stage == "completed":
+                # Answer follow-up questions about the completed session
+                if request:
+                    task = asyncio.create_task(
+                        self._handle_followup_question(
+                            self._app.client, existing, request, channel, thread_ts
+                        )
+                    )
+                    task.add_done_callback(self._on_task_done)
+                return
+            # stage == "clarifying" | "confirming"
             if request:
                 task = asyncio.create_task(
                     self._handle_clarification_reply(
@@ -548,6 +558,8 @@ class SlackInterface(BaseInterface):
                 await self.update_message(channel, status_ts, text)
 
         logger.info("Graph streaming started: session=%s", session_id[:8])
+        final_report = ""
+        error_msg    = ""
         try:
             async for event in graph.astream_events(
                 initial_state, config=config, version="v2"
@@ -582,15 +594,29 @@ class SlackInterface(BaseInterface):
 
                 elif event_name == "on_chain_end" and node_name == "finalize":
                     output = event.get("data", {}).get("output", {})
-                    report = output.get("final_report", "완료")
-                    await _post_or_update(f"완료\n\n{report}")
+                    final_report = output.get("final_report", "완료")
+                    await _post_or_update(f"완료\n\n{final_report}")
 
         except Exception as exc:
             logger.exception("Graph streaming error: %s", exc)
+            error_msg = str(exc)
             await _post_or_update(f"오류 발생: {exc}")
         finally:
-            # Clean up thread context when graph finishes (success or error)
-            await self._delete_thread(thread_ts)
+            # Keep thread context as "completed" so follow-up questions work.
+            # The summary field holds the final report for context.
+            state = self._pending_clarification.get(thread_ts) or {
+                "thread_ts": thread_ts,
+                "channel": channel,
+                "user_id": "",
+                "request": "",
+                "history": [],
+                "session_id": session_id,
+                "task_id": None,
+            }
+            state["stage"]   = "completed"
+            state["summary"] = final_report or (f"오류: {error_msg}" if error_msg else "")
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
 
     # ------------------------------------------------------------------
     # L4 escalation
@@ -624,6 +650,8 @@ class SlackInterface(BaseInterface):
         async def _post(text: str) -> None:
             await self.send_message(channel, text, thread_ts=thread_ts)
 
+        final_report = ""
+        error_msg    = ""
         try:
             async for event in graph.astream_events(
                 Command(resume=resume_value), config=config, version="v2"
@@ -632,12 +660,102 @@ class SlackInterface(BaseInterface):
                 node_name  = event.get("name", "")
                 if event_name == "on_chain_end" and node_name == "finalize":
                     output = event.get("data", {}).get("output", {})
-                    report = output.get("final_report", "완료")
-                    await _post(f"완료\n\n{report}")
+                    final_report = output.get("final_report", "완료")
+                    await _post(f"완료\n\n{final_report}")
         except Exception as exc:
+            error_msg = str(exc)
             await _post(f"재개 중 오류: {exc}")
         finally:
-            await self._delete_thread(thread_ts)
+            state = self._pending_clarification.get(thread_ts) or {
+                "thread_ts": thread_ts,
+                "channel": channel,
+                "user_id": "",
+                "request": "",
+                "history": [],
+                "session_id": session_id,
+                "task_id": None,
+            }
+            state["stage"]   = "completed"
+            state["summary"] = final_report or (f"오류: {error_msg}" if error_msg else "")
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+
+    # ------------------------------------------------------------------
+    # Follow-up Q&A on completed sessions
+    # ------------------------------------------------------------------
+
+    async def _handle_followup_question(
+        self,
+        client: Any,
+        state: dict,
+        question: str,
+        channel: str,
+        thread_ts: str,
+    ) -> None:
+        """Answer a follow-up question about a completed session using Slack thread history."""
+        original_request = state.get("request", "")
+        final_report     = state.get("summary", "")
+        session_id       = state.get("session_id", "")
+
+        thread_text = await self._fetch_thread_messages(client, channel, thread_ts)
+
+        context = (
+            f"## 원래 요청\n{original_request}\n\n"
+            f"## 최종 작업 보고서 (세션 {session_id[:8]})\n{final_report}\n\n"
+            f"## 스레드 대화 내역\n{thread_text}\n\n"
+            f"## 사용자 질문\n{question}"
+        )
+
+        try:
+            import anthropic
+            from agentforge.core.models import MODEL_IDS, ModelTier
+
+            ai = anthropic.AsyncAnthropic()
+            response = await ai.messages.create(
+                model=MODEL_IDS[ModelTier.SONNET],
+                max_tokens=1024,
+                system=(
+                    "당신은 AgentForge AI 시스템의 어시스턴트입니다.\n"
+                    "제공된 작업 보고서와 스레드 대화 내역을 바탕으로 사용자의 질문에 답하세요.\n"
+                    "실패 원인을 구체적으로 분석하고 개선 방안도 함께 제안하세요.\n"
+                    "작업 보고서에 없는 내용은 추측하지 말고 '확인이 필요합니다'라고 답하세요."
+                ),
+                messages=[{"role": "user", "content": context}],
+            )
+            answer = response.content[0].text
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text=answer
+            )
+        except Exception as exc:
+            logger.exception("Follow-up question error: %s", exc)
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"질문 처리 중 오류가 발생했습니다: {exc}"
+            )
+
+    async def _fetch_thread_messages(
+        self, client: Any, channel: str, thread_ts: str, limit: int = 30
+    ) -> str:
+        """Fetch and format messages from a Slack thread for LLM context."""
+        try:
+            resp = await client.conversations_replies(
+                channel=channel,
+                ts=thread_ts,
+                limit=limit,
+            )
+            lines = []
+            for msg in resp.get("messages", []):
+                text = msg.get("text", "").strip()
+                if not text:
+                    continue
+                bot_id = msg.get("bot_id", "")
+                user   = msg.get("user", "")
+                prefix = "[봇]" if bot_id else f"[사용자 {user[:6]}]"
+                lines.append(f"{prefix}: {text[:800]}")
+            return "\n".join(lines) if lines else "(메시지 없음)"
+        except Exception as exc:
+            logger.warning("Failed to fetch thread messages: %s", exc)
+            return "(스레드 메시지를 불러올 수 없음)"
 
     # ------------------------------------------------------------------
     # Complaint handling
