@@ -57,7 +57,63 @@ class SlackInterface(BaseInterface):
         )
         self._register_handlers()
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
+
+        # Print bot identity and channel membership before opening the socket
+        await self._log_startup_info()
+
         await self._handler.start_async()
+
+    async def _log_startup_info(self) -> None:
+        """Fetch and log bot identity + joined channels via Slack API."""
+        client = self._app.client
+        sep = "-" * 60
+
+        # 1. Bot identity (auth.test)
+        try:
+            auth = await client.auth_test()
+            bot_id   = auth.get("bot_id", "?")
+            bot_name = auth.get("user", "?")
+            team     = auth.get("team", "?")
+            user_id  = auth.get("user_id", "?")
+            logger.info(sep)
+            logger.info("AgentForge Slack Bot 시작됨")
+            logger.info("  봇 이름  : @%s", bot_name)
+            logger.info("  봇 ID    : %s  (User ID: %s)", bot_id, user_id)
+            logger.info("  워크스페이스: %s", team)
+            logger.info("  멘션 형식 : <@%s>", user_id)
+        except Exception as exc:
+            logger.error("auth.test 실패 — 토큰을 확인하세요: %s", exc)
+            return
+
+        # 2. Joined channels (conversations.list filtered to member=true)
+        try:
+            channels_resp = await client.conversations_list(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                limit=200,
+            )
+            joined = [
+                ch for ch in channels_resp.get("channels", [])
+                if ch.get("is_member")
+            ]
+            if joined:
+                logger.info("  참여 채널 (%d개):", len(joined))
+                for ch in joined:
+                    name    = ch.get("name", "?")
+                    ch_id   = ch.get("id", "?")
+                    members = ch.get("num_members", "?")
+                    logger.info("    #%s  (id=%s, members=%s)", name, ch_id, members)
+            else:
+                logger.warning(
+                    "  [!] 참여 중인 채널 없음 — 채널에 /invite @%s 를 실행하세요", bot_name
+                )
+        except Exception as exc:
+            logger.warning("conversations.list 실패: %s", exc)
+
+        # 3. Subscribed events summary
+        logger.info("  수신 이벤트 : app_mention")
+        logger.info("  인터랙션   : l4_continue, l4_abort (Block Kit 버튼)")
+        logger.info(sep)
 
     async def stop(self) -> None:
         if _MOCK or self._handler is None:
