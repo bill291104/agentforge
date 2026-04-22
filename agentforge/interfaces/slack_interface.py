@@ -85,7 +85,7 @@ class SlackInterface(BaseInterface):
             logger.error("auth.test 실패 — 토큰을 확인하세요: %s", exc)
             return
 
-        # 2. Joined channels (conversations.list filtered to member=true)
+        # 2. Joined channels — requires channels:read + groups:read scopes
         try:
             channels_resp = await client.conversations_list(
                 types="public_channel,private_channel",
@@ -104,11 +104,17 @@ class SlackInterface(BaseInterface):
                     members = ch.get("num_members", "?")
                     logger.info("    #%s  (id=%s, members=%s)", name, ch_id, members)
             else:
-                logger.warning(
-                    "  [!] 참여 중인 채널 없음 — 채널에 /invite @%s 를 실행하세요", bot_name
-                )
+                logger.warning("  [!] 참여 중인 채널 없음")
+                logger.warning("      채널에서 /invite @%s 를 실행하거나", bot_name)
+                logger.warning("      채널 설정 > 통합 > 앱 추가 로 초대하세요")
         except Exception as exc:
-            logger.warning("conversations.list 실패: %s", exc)
+            err_str = str(exc)
+            if "missing_scope" in err_str:
+                logger.info("  참여 채널 조회 불가 (channels:read 스코프 없음)")
+                logger.info("  -> Slack App 설정 > OAuth > Bot Scopes 에 channels:read 추가 후 재설치")
+                logger.info("  채널 초대 방법: 해당 채널에서 /invite @%s 입력", bot_name)
+            else:
+                logger.warning("  conversations.list 실패: %s", exc)
 
         # 3. Subscribed events summary
         logger.info("  수신 이벤트 : app_mention")
@@ -227,9 +233,40 @@ class SlackInterface(BaseInterface):
     def _register_handlers(self) -> None:
         app = self._app
 
+        # ------------------------------------------------------------------
+        # Catch-all middleware: log every incoming payload so we can see
+        # exactly what Slack sends, regardless of event type.
+        # ------------------------------------------------------------------
+        @app.middleware
+        async def log_all_events(payload: dict, next: Any) -> None:
+            event_type = (
+                payload.get("event", {}).get("type")
+                or payload.get("type")
+                or "unknown"
+            )
+            subtype = payload.get("event", {}).get("subtype", "")
+            channel = (
+                payload.get("event", {}).get("channel")
+                or payload.get("channel_id", "")
+            )
+            logger.debug(
+                "[Slack] 수신: type=%s%s channel=%s",
+                event_type,
+                f"/{subtype}" if subtype else "",
+                channel or "(없음)",
+            )
+            await next()
+
         @app.event("app_mention")
         async def handle_mention(event: dict, say: Any) -> None:
             await self._on_mention(event, say)
+
+        # Absorb unhandled message subtypes (bot messages, etc.) to prevent
+        # slack-bolt from logging "Unhandled request" warnings on every message.
+        @app.event("message")
+        async def handle_message(event: dict) -> None:
+            subtype = event.get("subtype", "")
+            logger.debug("[Slack] message event (subtype=%s) — not handled", subtype or "none")
 
         @app.action("l4_continue")
         async def handle_l4_continue(body: dict, ack: Any) -> None:

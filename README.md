@@ -99,25 +99,35 @@ AgentForge는 Slack Socket Mode로 동작한다.
 
 **OAuth & Permissions** -> **Bot Token Scopes** 에 추가:
 
-| Scope | 용도 |
-|-------|------|
-| `app_mentions:read` | @AgentForge 멘션 수신 |
-| `chat:write` | 메시지 전송 |
-| `chat:write.customize` | 메시지 수정 |
-| `channels:history` | 채널 메시지 읽기 |
-| `im:history` | DM 메시지 읽기 |
+| Scope | 필수 여부 | 용도 |
+|-------|-----------|------|
+| `app_mentions:read` | **필수** | @AgentForge 멘션 수신 |
+| `chat:write` | **필수** | 메시지 전송 |
+| `chat:write.customize` | **필수** | 메시지 수정 |
+| `channels:history` | **필수** | 채널 메시지 읽기 |
+| `im:history` | 권장 | DM 메시지 읽기 |
+| `channels:read` | 권장 | 시작 시 참여 채널 목록 진단 출력 |
+| `groups:read` | 권장 | 프라이빗 채널 진단 출력 |
+
+> **스코프 변경 후에는 반드시 앱을 재설치해야 한다.**  
+> **Install App** -> **Reinstall to Workspace**
 
 ### 3. 이벤트 구독 설정
 
 **Event Subscriptions** -> **Enable Events** -> On  
 **Subscribe to bot events** 에 추가:
-- `app_mention`
-- `message.channels`
+
+| 이벤트 | 용도 |
+|--------|------|
+| `app_mention` | **필수** — 채널에서 @AgentForge 멘션 수신 |
+| `message.channels` | 권장 — 일반 메시지 수신 (채널 진단용) |
+
+> **주의**: 이벤트 구독이 없으면 멘션을 해도 봇이 응답하지 않는다.
 
 ### 4. Interactivity 설정
 
 **Interactivity & Shortcuts** -> **Interactivity** -> On  
-(Socket Mode 사용 시 Request URL 불필요)
+(Socket Mode 사용 시 Request URL 불필요 — 자동 처리)
 
 ### 5. Socket Mode 활성화
 
@@ -132,6 +142,50 @@ AgentForge는 Slack Socket Mode로 동작한다.
 **Install App** -> **Install to Workspace**  
 - **Bot User OAuth Token** (`xoxb-...`) -> `SLACK_BOT_TOKEN`
 - **Signing Secret** (Basic Information 탭) -> `SLACK_SIGNING_SECRET`
+
+### 7. 채널에 봇 초대 (필수)
+
+앱 설치만으로는 채널에 봇이 추가되지 않는다.  
+사용할 채널에서 다음 중 하나를 실행한다:
+
+```
+/invite @agentforge
+```
+
+또는 **채널 이름 클릭 -> 통합 -> 앱 추가 -> AgentForge** 선택.
+
+> 초대 후 `uv run agentforge start` 시 로그에 참여 채널 목록이 표시된다.  
+> 목록이 비어 있으면 초대가 되지 않은 것이다.
+
+### 시작 시 진단 로그 예시
+
+정상 설정 시:
+```
+------------------------------------------------------------
+AgentForge Slack Bot 시작됨
+  봇 이름  : @agentforge
+  봇 ID    : B0XXXXXXX  (User ID: U0XXXXXXX)
+  워크스페이스: My Workspace
+  멘션 형식 : <@U0XXXXXXX>
+  참여 채널 (1개):
+    #dev-team  (id=C0XXXXX, members=5)
+  수신 이벤트 : app_mention
+------------------------------------------------------------
+```
+
+`channels:read` 스코프 없을 때 (봇 동작엔 무관):
+```
+  참여 채널 조회 불가 (channels:read 스코프 없음)
+  -> Slack App 설정 > OAuth > Bot Scopes 에 channels:read 추가 후 재설치
+  채널 초대 방법: 해당 채널에서 /invite @agentforge 입력
+```
+
+모든 수신 이벤트를 보려면 `AF_LOG_LEVEL=DEBUG` 로 시작한다:
+```bash
+AF_LOG_LEVEL=DEBUG uv run agentforge start
+# [Slack] 수신: type=app_mention channel=C0XXXXX
+# [Slack] 수신: type=message/bot_message channel=C0XXXXX
+```
 
 ---
 
