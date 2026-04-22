@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
+
+load_dotenv()
 
 app = typer.Typer(help="AgentForge - Agent-based development team orchestrator")
 console = Console()
