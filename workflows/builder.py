@@ -70,7 +70,10 @@ class GraphBuilder:
             dispatch_workers_node,
             escalate_node,
             finalize_node,
+            interrupt_l2_node,
             interrupt_l4_node,
+            merge_task_node,
+            present_plan_node,
             refine_requirements_node,
             spawn_sub_orchestrator_node,
             verify_ci_node,
@@ -78,6 +81,8 @@ class GraphBuilder:
         )
         from agentforge.graph.edges import (
             route_after_escalate,
+            route_after_merge_task,
+            route_after_present_plan,
             route_after_verify_ci,
             route_after_verify_semantic,
             route_context,
@@ -85,36 +90,45 @@ class GraphBuilder:
 
         graph.add_node("refine_requirements", refine_requirements_node)
         graph.add_node("build_dag", build_dag_node)
+        graph.add_node("present_plan", present_plan_node)
         graph.add_node("check_context", check_context_node)
         graph.add_node("compress_context", compress_context_node)
         graph.add_node("spawn_sub_orchestrator", spawn_sub_orchestrator_node)
         graph.add_node("dispatch_workers", dispatch_workers_node)
         graph.add_node("verify_ci", verify_ci_node)
         graph.add_node("verify_semantic", verify_semantic_node)
+        graph.add_node("merge_task", merge_task_node)
         graph.add_node("escalate", escalate_node)
+        graph.add_node("interrupt_l2", interrupt_l2_node)
         graph.add_node("interrupt_l4", interrupt_l4_node)
         graph.add_node("finalize", finalize_node)
 
         # Fixed edges
         graph.set_entry_point("refine_requirements")
         graph.add_edge("refine_requirements", "build_dag")
-        graph.add_edge("build_dag", "check_context")
+        graph.add_edge("build_dag", "present_plan")
         graph.add_edge("compress_context", "dispatch_workers")
         graph.add_edge("spawn_sub_orchestrator", "dispatch_workers")
         graph.add_edge("dispatch_workers", "verify_ci")
+        graph.add_edge("interrupt_l2", "dispatch_workers")
         graph.add_edge("interrupt_l4", END)
         graph.add_edge("finalize", END)
 
         # Conditional edges
+        graph.add_conditional_edges("present_plan", route_after_present_plan)
         graph.add_conditional_edges("check_context", route_context)
         graph.add_conditional_edges("verify_ci", route_after_verify_ci)
         graph.add_conditional_edges("verify_semantic", route_after_verify_semantic)
+        graph.add_conditional_edges("merge_task", route_after_merge_task)
         graph.add_conditional_edges("escalate", route_after_escalate)
 
         # Store spec in compiled graph for reference
+        # interrupt_l2_node and interrupt_l4_node use interrupt() internally —
+        # adding interrupt_before would cause a double-pause (interrupt_before fires,
+        # then the node's own interrupt() fires), requiring two Command(resume=...)
+        # calls and showing the approval button twice. Rely on interrupt() only.
         compiled = graph.compile(
             checkpointer=get_checkpointer() if with_checkpointer else None,
-            interrupt_before=["interrupt_l4"],
         )
         compiled._workflow_spec = spec  # type: ignore[attr-defined]
         return compiled

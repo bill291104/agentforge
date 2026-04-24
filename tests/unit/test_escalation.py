@@ -110,10 +110,12 @@ class TestRouteAfterEscalate:
     def test_l1_retries(self):
         assert route_after_escalate(make_state(current_escalation_level=1)) == "dispatch_workers"
 
-    def test_l2_retries(self):
-        assert route_after_escalate(make_state(current_escalation_level=2)) == "dispatch_workers"
+    def test_l2_requests_user_approval(self):
+        # L2 = 2 retries exhausted → ask user before upgrading model
+        assert route_after_escalate(make_state(current_escalation_level=2)) == "interrupt_l2"
 
     def test_l3_retries_independent(self):
+        # L3 = user approved upgrade, model upgraded → route to dispatch
         assert route_after_escalate(make_state(current_escalation_level=3)) == "dispatch_workers"
 
     def test_l4_interrupts(self):

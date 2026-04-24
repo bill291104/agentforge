@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from agentforge.core.models import (
     EscalationLevel,
@@ -39,6 +43,18 @@ def _is_mock() -> bool:
     return os.getenv("AF_MOCK_MODE", "false").lower() == "true"
 
 
+def _build_failure_context(node: TaskNode, state: AgentForgeState) -> str:
+    parts = []
+    if node.report:
+        parts.append(f"**워커 보고**: {node.report.summary[:300]}")
+    sem = state.get("semantic_result") or {}
+    if sem.get("rejection_reason"):
+        parts.append(f"**검증 거부 이유**: {sem['rejection_reason'][:300]}")
+    if sem.get("suggested_fix"):
+        parts.append(f"**권장 수정**: {sem['suggested_fix'][:300]}")
+    return "\n".join(parts) if parts else "이전 시도에서 git_commit이 호출되지 않았거나 수락 기준 미달."
+
+
 # ---------------------------------------------------------------------------
 # Node: refine_requirements
 # ---------------------------------------------------------------------------
@@ -51,6 +67,8 @@ async def refine_requirements_node(state: AgentForgeState) -> dict[str, Any]:
     from agentforge.core.registry import AgentRegistry
     from agentforge.core.models import TaskSpec
 
+    logger.info("[refine] user_request=%.120s", state.get("user_request", ""))
+
     if _is_mock():
         spec = WorkflowSpec(
             name="mock_workflow",
@@ -59,11 +77,33 @@ async def refine_requirements_node(state: AgentForgeState) -> dict[str, Any]:
                          acceptance_criteria=["done"]),
             ],
         )
+        logger.info("[refine] mock workflow=%s tasks=%s", spec.name, [(t.id, str(t.model_tier)) for t in spec.tasks])
         return {"workflow_spec": spec}
 
     from agentforge.agents.leader import LeaderAgent
     agent = LeaderAgent()
-    spec = await agent.refine_requirements(state["user_request"])
+    user_request = state["user_request"]
+    spec = await agent.refine_requirements(user_request)
+
+    # If parsing fell back to a skeleton spec, inject user_request as description
+    # so the worker has something to work with even in degraded mode.
+    if spec.name == "fallback":
+        logger.warning("[refine] fallback spec — injecting user_request into task description")
+        from agentforge.core.models import TaskSpec
+        spec = spec.model_copy(update={
+            "tasks": [
+                spec.tasks[0].model_copy(update={
+                    "description": user_request,
+                    "acceptance_criteria": ["요구사항을 구현한 파일 생성", "코드가 실행 가능한 상태"],
+                })
+            ]
+        })
+
+    logger.info(
+        "[refine] workflow=%s tasks=%s",
+        spec.name,
+        [(t.id, str(t.model_tier)) for t in spec.tasks],
+    )
     return {"workflow_spec": spec}
 
 
@@ -93,6 +133,30 @@ async def build_dag_node(state: AgentForgeState) -> dict[str, Any]:
         node = TaskNode(instruction=instruction)
         task_nodes[task_spec.id] = node
         dag_index[task_spec.id] = TaskStatus.PENDING
+
+    logger.info(
+        "[build_dag] tasks=%s deps=%s",
+        list(task_nodes.keys()),
+        {t.id: t.depends_on for t in spec.tasks},
+    )
+
+    # Write instruction files to workspace so workers can read them
+    workspace_root = state.get("workspace_root", "")
+    if workspace_root:
+        ws_root_path = Path(workspace_root).resolve()
+        if ws_root_path.exists():
+            from agentforge.workspace.manager import WorkspaceManager
+            ws = WorkspaceManager(ws_root_path.name)
+            ws.root = ws_root_path
+            for spec_task in spec.tasks:
+                node = task_nodes[spec_task.id]
+                content = _render_instruction(node.instruction)
+                ws.write_instruction(spec_task.id, content)
+            sha = ws.commit("chore: write task instructions")
+            logger.info(
+                "[build_dag] wrote %d instruction file(s) commit=%s",
+                len(spec.tasks), sha,
+            )
 
     return {"task_nodes": task_nodes, "dag_index": dag_index}
 
@@ -181,19 +245,33 @@ async def dispatch_workers_node(state: AgentForgeState) -> dict[str, Any]:
     dag_index = dict(state.get("dag_index", {}))
     delegated = set(state.get("delegated_task_ids", []))
 
+    logger.info(
+        "[dispatch] dag_index=%s delegated=%s",
+        {k: str(v) for k, v in dag_index.items()},
+        list(delegated),
+    )
+
     ready_ids = [
         tid for tid in _get_ready_task_ids(task_nodes, dag_index)
         if tid not in delegated
     ]
+    workspace_root = state.get("workspace_root", "")
+    logger.info("[dispatch] ready_ids=%s workspace_root=%s", ready_ids, workspace_root)
 
     if not ready_ids:
         # All done or all blocked — pick first failing for escalation target
+        logger.warning("[dispatch] no ready tasks — dag_index=%s", {k: str(v) for k, v in dag_index.items()})
         return {"current_task_id": None}
 
     from agentforge.agents.worker import WorkerAgent
 
     async def run_task(tid: str) -> tuple[str, TaskReport]:
         node = task_nodes[tid]
+        logger.info(
+            "[dispatch] starting task=%s model=%s title=%.60s description_len=%d",
+            tid, node.instruction.model_tier, node.instruction.title,
+            len(node.instruction.description or ""),
+        )
         node = node.model_copy(update={
             "status": TaskStatus.RUNNING,
             "started_at": datetime.now(UTC),
@@ -249,10 +327,13 @@ async def dispatch_workers_node(state: AgentForgeState) -> dict[str, Any]:
 async def verify_ci_node(state: AgentForgeState) -> dict[str, Any]:
     """Run CI (mechanical) verification on the last completed task."""
     task_id = state.get("current_task_id")
+    logger.info("[verify_ci] task=%s", task_id)
     if not task_id:
+        logger.info("[verify_ci] no task_id — skipping, ci_passed=True")
         return {"ci_passed": True, "ci_result": {}}
 
     node = state["task_nodes"].get(task_id)
+    logger.info("[verify_ci] task=%s has_report=%s", task_id, bool(node and node.report))
     if not node or not node.report:
         return {"ci_passed": True, "ci_result": {}}
 
@@ -277,7 +358,9 @@ async def verify_ci_node(state: AgentForgeState) -> dict[str, Any]:
 async def verify_semantic_node(state: AgentForgeState) -> dict[str, Any]:
     """Run Opus semantic verification."""
     task_id = state.get("current_task_id")
+    logger.info("[verify_semantic] task=%s ci_passed=%s", task_id, state.get("ci_passed"))
     if not task_id:
+        logger.info("[verify_semantic] no task_id — skipping, verdict=ACCEPT")
         return {"semantic_result": {"verdict": "ACCEPT"}}
 
     node = state["task_nodes"].get(task_id)
@@ -311,27 +394,47 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
     node = task_nodes[task_id]
     level = node.escalation_level
 
-    logger.info("[escalate] task=%s level=%s", task_id, level)
+    logger.info(
+        "[escalate] task=%s level=%s dag_snapshot=%s",
+        task_id, level,
+        {k: str(v) for k, v in dag_index.items()},
+    )
 
     if level == EscalationLevel.L0:
-        # Retry same agent with rejection notice
+        # Retry same agent — enrich instructions with failure context
         new_level = EscalationLevel.L1
+        failure_ctx = _build_failure_context(node, state)
+        enriched_desc = (
+            node.instruction.description
+            + f"\n\n---\n## ⚠️ 재시도 1회차 (이전 실패 원인)\n{failure_ctx}"
+        )
+        new_instruction = node.instruction.model_copy(update={"description": enriched_desc})
         node = node.model_copy(update={
             "escalation_level": new_level,
             "status": TaskStatus.PENDING,
+            "instruction": new_instruction,
             "report": None,
         })
-        logger.info("[escalate] L0→L1: retry same agent task=%s", task_id)
+        dag_index[task_id] = TaskStatus.PENDING
+        logger.info("[escalate] L0→L1: retry same agent task=%s failure_ctx=%.80s", task_id, failure_ctx)
     elif level == EscalationLevel.L1:
-        # Spawn new agent of same tier
+        # Spawn new agent of same tier — enrich instructions further
         new_level = EscalationLevel.L2
+        failure_ctx = _build_failure_context(node, state)
+        enriched_desc = (
+            node.instruction.description  # already has 1st retry context
+            + f"\n\n## ⚠️ 재시도 2회차 (추가 실패 원인)\n{failure_ctx}"
+        )
+        new_instruction = node.instruction.model_copy(update={"description": enriched_desc})
         node = node.model_copy(update={
             "escalation_level": new_level,
             "status": TaskStatus.PENDING,
+            "instruction": new_instruction,
             "assigned_agent_id": None,
             "report": None,
         })
-        logger.info("[escalate] L1→L2: spawn new agent task=%s", task_id)
+        dag_index[task_id] = TaskStatus.PENDING
+        logger.info("[escalate] L1→L2: spawn new agent task=%s failure_ctx=%.80s", task_id, failure_ctx)
     elif level == EscalationLevel.L2:
         # Upgrade model tier
         upgraded_tier = _upgrade_tier(node.instruction.model_tier)
@@ -343,6 +446,7 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
             "report": None,
         })
         new_level = EscalationLevel.L3
+        dag_index[task_id] = TaskStatus.PENDING  # reset so dispatch_workers picks it up
         logger.info(
             "[escalate] L2→L3: upgrade tier %s→%s task=%s",
             node.instruction.model_tier, upgraded_tier, task_id,
@@ -377,16 +481,63 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
 # Node: interrupt_l4
 # ---------------------------------------------------------------------------
 
+async def interrupt_l2_node(state: AgentForgeState) -> dict[str, Any]:
+    """Pause and request user approval before upgrading model tier (L2 escalation)."""
+    from langgraph.types import interrupt
+
+    task_id = state.get("current_task_id", "unknown")
+    task_nodes = dict(state.get("task_nodes", {}))
+    dag_index  = dict(state.get("dag_index", {}))
+    node = task_nodes.get(task_id)
+    current_tier = node.instruction.model_tier if node else ModelTier.HAIKU
+    next_tier    = _upgrade_tier(current_tier)
+
+    logger.info("[interrupt_l2] task=%s tier=%s→%s", task_id, current_tier, next_tier)
+
+    user_choice = interrupt({
+        "type": "l2_approval",
+        "task_id": task_id,
+        "current_tier": str(current_tier),
+        "next_tier": str(next_tier),
+    })
+
+    if user_choice.get("choice") == "upgrade":
+        new_instruction = node.instruction.model_copy(update={"model_tier": next_tier})
+        task_nodes[task_id] = node.model_copy(update={
+            "instruction": new_instruction,
+            "status": TaskStatus.PENDING,
+            "escalation_level": EscalationLevel.L3,
+            "report": None,
+        })
+        dag_index[task_id] = TaskStatus.PENDING
+        logger.info("[interrupt_l2] user approved upgrade → %s", next_tier)
+        return {
+            "task_nodes": task_nodes,
+            "dag_index": dag_index,
+            "current_escalation_level": int(EscalationLevel.L3),
+        }
+    else:
+        if node:
+            task_nodes[task_id] = node.model_copy(update={"status": TaskStatus.FAILED})
+        dag_index[task_id] = TaskStatus.FAILED
+        logger.info("[interrupt_l2] user declined — task %s permanently failed", task_id)
+        return {
+            "task_nodes": task_nodes,
+            "dag_index": dag_index,
+            "current_escalation_level": int(EscalationLevel.L4),
+        }
+
+
 async def interrupt_l4_node(state: AgentForgeState) -> dict[str, Any]:
-    """Generate L4 user report. Actual interrupt is handled by LangGraph."""
+    """Pause for user intervention before ending the graph at L4 escalation."""
+    from langgraph.types import interrupt
+
     task_id = state.get("current_task_id", "unknown")
     task_nodes = state.get("task_nodes", {})
     dag_index = state.get("dag_index", {})
 
     blocked = [tid for tid, s in dag_index.items() if s == TaskStatus.BLOCKED]
-    still_runnable = [
-        tid for tid in _get_ready_task_ids(task_nodes, dag_index)
-    ]
+    still_runnable = list(_get_ready_task_ids(task_nodes, dag_index))
 
     report = (
         f"⚠️ L4 에스컬레이션: `{task_id}` 태스크가 자동 해결 불가\n"
@@ -394,7 +545,112 @@ async def interrupt_l4_node(state: AgentForgeState) -> dict[str, Any]:
         f"계속 진행 가능한 태스크: {still_runnable}\n\n"
         "진행 방법을 선택해주세요: [재시도] [중단]"
     )
+
+    # Pause here and wait for user choice via Command(resume="continue"|"stop")
+    interrupt({
+        "type": "l4_approval",
+        "task_id": task_id,
+        "report": report,
+    })
+
     return {"final_report": report}
+
+
+# ---------------------------------------------------------------------------
+# Node: present_plan
+# ---------------------------------------------------------------------------
+
+async def present_plan_node(state: AgentForgeState) -> dict[str, Any]:
+    """Present the generated plan to the user and wait for approval."""
+    from langgraph.types import interrupt
+
+    task_nodes = state.get("task_nodes", {})
+
+    lines = ["## 📋 작업 계획서\n", f"총 {len(task_nodes)}개 태스크\n"]
+    for tid, node in task_nodes.items():
+        inst = node.instruction
+        tier = str(inst.model_tier).split(".")[-1].capitalize()
+        deps = ", ".join(f"`{d}`" for d in inst.depends_on) or "없음"
+        criteria = "\n".join(f"  - {c}" for c in inst.acceptance_criteria)
+        lines += [
+            f"### `{tid}` — {inst.title}",
+            f"모델: {tier} | 타임아웃: {inst.timeout_minutes}분 | 의존: {deps}",
+            (inst.description or "")[:300],
+            f"수락 기준:\n{criteria}",
+            "",
+        ]
+    plan_md = "\n".join(lines)
+
+    ws_root = state.get("workspace_root", "")
+    if ws_root:
+        ws_path = Path(ws_root)
+        if ws_path.exists():
+            from agentforge.workspace.manager import WorkspaceManager
+            ws = WorkspaceManager(ws_path.name)
+            ws.root = ws_path
+            (ws.root / "PLAN.md").write_text(plan_md, encoding="utf-8")
+            ws.commit("docs: write project plan")
+
+    logger.info("[present_plan] plan ready — interrupting for approval")
+    user_choice = interrupt({"type": "plan_approval", "plan": plan_md})
+
+    if isinstance(user_choice, dict) and user_choice.get("action") == "modify":
+        feedback = user_choice.get("feedback", "")
+        logger.info("[present_plan] user requested modification: %.80s", feedback)
+        updated_request = state.get("user_request", "") + f"\n\n수정 요청: {feedback}"
+        return {
+            "user_request": updated_request,
+            "task_nodes": {},
+            "dag_index": {},
+            "workflow_spec": None,
+        }
+
+    logger.info("[present_plan] user approved plan")
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Node: merge_task
+# ---------------------------------------------------------------------------
+
+async def merge_task_node(state: AgentForgeState) -> dict[str, Any]:
+    """Merge the completed task branch into main and update PLAN.md."""
+    task_id = state.get("current_task_id")
+    ws_root = state.get("workspace_root", "")
+
+    if not (task_id and ws_root):
+        return {}
+
+    ws_path = Path(ws_root)
+    from agentforge.workspace.manager import WorkspaceManager
+    ws = WorkspaceManager(ws_path.name)
+    ws.root = ws_path
+
+    sha = ""
+    try:
+        sha = ws.merge_branch(f"task/{task_id}", into="main")
+        logger.info("[merge_task] merged task/%s → main sha=%s", task_id, sha)
+    except Exception as exc:
+        logger.warning("[merge_task] merge failed for task/%s: %s", task_id, exc)
+
+    plan_path = ws.root / "PLAN.md"
+    if plan_path.exists():
+        try:
+            content = plan_path.read_text(encoding="utf-8")
+            sha_tag = f" (merge: {sha[:7]})" if sha else ""
+            content = content.replace(
+                f"### `{task_id}`",
+                f"### ✅ `{task_id}`{sha_tag}",
+            )
+            plan_path.write_text(content, encoding="utf-8")
+            ws.commit(f"docs: {task_id} complete")
+        except Exception as exc:
+            logger.warning("[merge_task] PLAN.md update failed: %s", exc)
+
+    node = state.get("task_nodes", {}).get(task_id)
+    summary = (node.report.summary[:100] if (node and node.report) else "")
+    summaries = list(state.get("completed_summaries", [])) + [f"[{task_id}] {summary}"]
+    return {"completed_summaries": summaries}
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +659,7 @@ async def interrupt_l4_node(state: AgentForgeState) -> dict[str, Any]:
 
 async def finalize_node(state: AgentForgeState) -> dict[str, Any]:
     """Generate completion report."""
+    task_nodes = state.get("task_nodes", {})
     dag_index = state.get("dag_index", {})
     summaries = state.get("completed_summaries", [])
     escalations = state.get("escalation_history", [])
@@ -411,23 +668,65 @@ async def finalize_node(state: AgentForgeState) -> dict[str, Any]:
     completed = sum(1 for s in dag_index.values() if s == TaskStatus.COMPLETED)
     total = len(dag_index)
     failed = sum(1 for s in dag_index.values() if s == TaskStatus.FAILED)
+    retries = sum(
+        n.attempt_count - 1 for n in task_nodes.values() if n.attempt_count > 1
+    )
+    tokens = sum(
+        n.report.tokens_used for n in task_nodes.values() if n.report and n.report.tokens_used
+    )
+    duration = sum(
+        n.report.duration_seconds for n in task_nodes.values() if n.report and n.report.duration_seconds
+    )
 
-    lines = [
-        f"작업 완료",
-        f"완료: {completed}/{total}  실패: {failed}  에스컬레이션: {len(escalations)}회",
-    ]
-    if summaries:
-        lines += ["", "산출물 요약:"] + [f"  - {s}" for s in summaries]
+    ws = None
+    git_log = ""
     if workspace_root:
         from agentforge.workspace.manager import WorkspaceManager
-        from pathlib import Path
         ws = WorkspaceManager(Path(workspace_root).name)
         ws.root = Path(workspace_root)
-        git_log = ws.git_log(n=5)
-        if git_log:
-            lines += ["", f"작업 디렉토리: `{workspace_root}`", "최근 커밋:", f"```\n{git_log}\n```"]
+        git_log = ws.git_log(n=10)
 
-    return {"final_report": "\n".join(lines)}
+    run_guide = _detect_run_guide(ws)
+
+    report = "\n".join(filter(None, [
+        "## 🎉 작업 완료 보고서",
+        f"완료: {completed}/{total} | 실패: {failed} | 재시도: {retries}회 | 토큰: {tokens:,} | 소요: {duration:.0f}초",
+        "",
+        "### 산출물" if summaries else "",
+        *[f"- {s}" for s in summaries],
+        "",
+        "### 실행 방법",
+        run_guide,
+        "",
+        "### 최근 커밋 (main)",
+        f"```\n{git_log}\n```" if git_log else "",
+    ]))
+
+    if ws:
+        try:
+            (ws.root / "FINAL_REPORT.md").write_text(report, encoding="utf-8")
+            ws.commit("docs: final report")
+        except Exception as exc:
+            logger.warning("[finalize] FINAL_REPORT.md write failed: %s", exc)
+
+    return {"final_report": report}
+
+
+def _detect_run_guide(ws) -> str:
+    """Detect how to run the project from file existence — no LLM needed."""
+    if ws is None:
+        return "(워크스페이스 없음)"
+    checks = [
+        (ws.root / "package.json",       "```\nnpm install && npm run dev\n```\n→ http://localhost:3000"),
+        (ws.root / "requirements.txt",   "```\npip install -r requirements.txt\npython main.py\n```"),
+        (ws.root / "pyproject.toml",     "```\nuv run python main.py\n```"),
+        (ws.root / "Makefile",           "```\nmake run\n```"),
+        (ws.root / "docker-compose.yml", "```\ndocker compose up\n```"),
+    ]
+    for path, guide in checks:
+        if path.exists():
+            return guide
+    return "(README.md 또는 워크스페이스를 확인하세요)"
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +763,20 @@ def _cascade_block(
                 dag_index[tid] = TaskStatus.BLOCKED
                 task_nodes[tid] = node.model_copy(update={"status": TaskStatus.BLOCKED})
                 _cascade_block(tid, task_nodes, dag_index)
+
+
+def _render_instruction(instruction: TaskInstruction) -> str:
+    """Render a task instruction as markdown for the worker to read."""
+    criteria = "\n".join(f"- {c}" for c in instruction.acceptance_criteria)
+    return (
+        f"# Task: {instruction.task_id}\n"
+        f"**Branch**: task/{instruction.task_id}\n"
+        f"**Model tier**: {instruction.model_tier}\n"
+        f"**Timeout**: {instruction.timeout_minutes}분\n\n"
+        f"## 설명\n{instruction.description}\n\n"
+        f"## 필요 입력\n{instruction.inputs or '(없음)'}\n\n"
+        f"## 수락 기준\n{criteria}\n"
+    )
 
 
 def _upgrade_tier(tier: ModelTier) -> ModelTier:

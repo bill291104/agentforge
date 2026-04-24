@@ -28,37 +28,53 @@ def route_after_verify_ci(state: AgentForgeState) -> str:
 def route_after_verify_semantic(state: AgentForgeState) -> str:
     result  = state.get("semantic_result", {})
     verdict = result.get("verdict", "REJECT")
-    dag_index = state.get("dag_index", {})
 
     logger.info("[route] verify_semantic verdict=%s", verdict)
 
     if verdict == "ACCEPT":
-        # Only finalize when all tasks have a terminal status AND at least one completed.
-        # If everything failed/blocked, keep escalating (or let escalate handle it).
-        terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED}
-        all_terminal = all(s in terminal for s in dag_index.values())
-        any_completed = any(s == TaskStatus.COMPLETED for s in dag_index.values())
-
-        if not dag_index or (all_terminal and any_completed):
-            logger.info("[route] → finalize (completed=%d/%d)",
-                        sum(1 for s in dag_index.values() if s == TaskStatus.COMPLETED),
-                        len(dag_index))
-            return "finalize"
-
-        if all_terminal and not any_completed:
-            # Everything failed — escalate so the escalation loop can decide
-            logger.info("[route] all tasks failed/blocked, forcing escalate")
-            return "escalate"
-
-        logger.info("[route] → check_context (more tasks pending)")
-        return "check_context"
+        logger.info("[route] → merge_task")
+        return "merge_task"
 
     logger.info("[route] → escalate (reason=%.80s)", result.get("rejection_reason", ""))
     return "escalate"
 
 
+def route_after_merge_task(state: AgentForgeState) -> str:
+    dag_index = state.get("dag_index", {})
+    terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED}
+    all_terminal = all(s in terminal for s in dag_index.values())
+    any_completed = any(s == TaskStatus.COMPLETED for s in dag_index.values())
+
+    if not dag_index or (all_terminal and any_completed):
+        logger.info("[route] merge_task → finalize (completed=%d/%d)",
+                    sum(1 for s in dag_index.values() if s == TaskStatus.COMPLETED),
+                    len(dag_index))
+        return "finalize"
+
+    if all_terminal and not any_completed:
+        logger.info("[route] merge_task → escalate (all failed/blocked)")
+        return "escalate"
+
+    logger.info("[route] merge_task → check_context (more tasks pending)")
+    return "check_context"
+
+
+def route_after_present_plan(state: AgentForgeState) -> str:
+    """After plan approval: if task_nodes cleared (modify request), re-plan; else continue."""
+    if not state.get("task_nodes"):
+        logger.info("[route] present_plan → refine_requirements (user requested modification)")
+        return "refine_requirements"
+    logger.info("[route] present_plan → check_context (plan approved)")
+    return "check_context"
+
+
 def route_after_escalate(state: AgentForgeState) -> str:
     level = state.get("current_escalation_level", 0)
-    dest = "interrupt_l4" if level >= EscalationLevel.L4 else "dispatch_workers"
+    if level >= EscalationLevel.L4:
+        dest = "interrupt_l4"
+    elif level == EscalationLevel.L2:
+        dest = "interrupt_l2"   # 2회 재시도 소진 → 사용자 승인 요청
+    else:
+        dest = "dispatch_workers"   # L0→L1, L1→L2(retry), L3(approved upgrade)
     logger.info("[route] escalate level=%d → %s", level, dest)
     return dest

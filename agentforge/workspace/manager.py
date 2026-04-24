@@ -115,6 +115,52 @@ class WorkspaceManager:
         )
         return result.stdout
 
+    def create_branch(self, branch_name: str) -> None:
+        """Create (or reset) a feature branch for a task."""
+        self._git("checkout", "-B", branch_name)
+        logger.info("Branch created/reset: %s", branch_name)
+
+    def checkout(self, branch_name: str) -> None:
+        self._git("checkout", branch_name)
+
+    def write_instruction(self, task_id: str, content: str) -> Path:
+        """Write instruction markdown to instructions/{task_id}.md."""
+        instructions_dir = self.root / "instructions"
+        instructions_dir.mkdir(exist_ok=True)
+        path = instructions_dir / f"{task_id}.md"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def merge_branch(self, branch: str, into: str = "main") -> str:
+        """Merge feature branch into target branch. Returns short SHA of merge commit."""
+        current = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=self.root, capture_output=True, text=True,
+        ).stdout.strip()
+        self._git("checkout", into)
+        try:
+            result = self._git("merge", "--no-ff", branch, "-m", f"merge: {branch} → {into}")
+            if result.returncode != 0:
+                self._git("merge", "--abort")
+                raise subprocess.CalledProcessError(result.returncode, "merge", result.stderr)
+            sha = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=self.root, capture_output=True, text=True,
+            ).stdout.strip()
+            logger.info("Merged %s → %s at %s", branch, into, sha)
+            return sha
+        finally:
+            if current and current != into:
+                self._git("checkout", current)
+
+    def diff_files(self, base: str = "HEAD~1") -> list[str]:
+        """Return list of file paths changed since base commit."""
+        result = subprocess.run(
+            ["git", "diff", "--name-only", base],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        return [f for f in result.stdout.strip().splitlines() if f]
+
     # ------------------------------------------------------------------
     # Test runner (Docker → local fallback)
     # ------------------------------------------------------------------

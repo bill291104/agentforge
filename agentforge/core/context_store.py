@@ -39,11 +39,18 @@ class ThreadContextStore:
                 request     TEXT NOT NULL,
                 history     TEXT NOT NULL DEFAULT '[]',
                 summary     TEXT,
+                result      TEXT,
                 session_id  TEXT,
                 task_id     TEXT,
                 updated_at  TEXT NOT NULL
             )
         """)
+        # Migrate existing DBs that don't have the result column yet
+        try:
+            await self._conn.execute("ALTER TABLE thread_contexts ADD COLUMN result TEXT")
+            await self._conn.commit()
+        except Exception:
+            pass  # column already exists
         await self._conn.commit()
 
     async def save(self, thread_ts: str, state: dict) -> None:
@@ -52,8 +59,8 @@ class ThreadContextStore:
             """
             INSERT INTO thread_contexts
                 (thread_ts, channel, user_id, stage, request, history,
-                 summary, session_id, task_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 summary, result, session_id, task_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(thread_ts) DO UPDATE SET
                 channel    = excluded.channel,
                 user_id    = excluded.user_id,
@@ -61,6 +68,7 @@ class ThreadContextStore:
                 request    = excluded.request,
                 history    = excluded.history,
                 summary    = excluded.summary,
+                result     = excluded.result,
                 session_id = excluded.session_id,
                 task_id    = excluded.task_id,
                 updated_at = excluded.updated_at
@@ -73,6 +81,7 @@ class ThreadContextStore:
                 state.get("request", ""),
                 json.dumps(state.get("history", []), ensure_ascii=False),
                 state.get("summary"),
+                state.get("result"),
                 state.get("session_id"),
                 state.get("task_id"),
                 now,
@@ -90,18 +99,18 @@ class ThreadContextStore:
         """Load all persisted thread states. Called once on startup."""
         cursor = await self._conn.execute(
             "SELECT thread_ts, channel, user_id, stage, request, "
-            "history, summary, session_id, task_id FROM thread_contexts"
+            "history, summary, result, session_id, task_id FROM thread_contexts"
         )
         rows = await cursor.fetchall()
-        result: dict[str, dict] = {}
+        out: dict[str, dict] = {}
         for row in rows:
             (thread_ts, channel, user_id, stage, request,
-             history_json, summary, session_id, task_id) = row
+             history_json, summary, result_val, session_id, task_id) = row
             try:
                 history = json.loads(history_json or "[]")
             except json.JSONDecodeError:
                 history = []
-            result[thread_ts] = {
+            out[thread_ts] = {
                 "thread_ts": thread_ts,
                 "channel": channel,
                 "user_id": user_id,
@@ -109,12 +118,13 @@ class ThreadContextStore:
                 "request": request,
                 "history": history,
                 "summary": summary,
+                "result": result_val,
                 "session_id": session_id,
                 "task_id": task_id,
             }
-        if result:
-            logger.info("Loaded %d thread context(s) from DB", len(result))
-        return result
+        if out:
+            logger.info("Loaded %d thread context(s) from DB", len(out))
+        return out
 
 
 async def init_context_store() -> ThreadContextStore:

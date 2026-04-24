@@ -15,43 +15,6 @@ _MOCK = os.getenv("AF_MOCK_MODE", "false").lower() == "true"
 _CONFIRM_KEYWORDS = {"네", "예", "yes", "y", "진행", "ㅇㅇ", "ok", "확인", "go", "그래"}
 _CANCEL_KEYWORDS  = {"아니오", "아니", "no", "n", "취소", "cancel", "그만", "중단"}
 
-# Tools the LLM can call when responding to a mention in a completed thread
-_COMPLETED_THREAD_TOOLS = [
-    {
-        "name": "start_new_task",
-        "description": (
-            "이전 작업을 재시작하거나 수정된 요구사항으로 새 작업을 시작합니다. "
-            "사용자가 다시 시도하거나, 수정/개선을 원하거나, 새 기능을 추가하고 싶을 때 사용합니다."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "request": {
-                    "type": "string",
-                    "description": "새 작업 요청 내용. 비어 있으면 이전 요구사항을 그대로 사용합니다.",
-                }
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "answer_question",
-        "description": (
-            "완료(또는 실패)된 세션에 대한 질문에 답합니다. "
-            "실패 원인 분석, 결과 설명, 개선 방안 제안, 진행 상황 문의 등에 사용합니다."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": "사용자 질문에 대한 답변 (마크다운 허용).",
-                }
-            },
-            "required": ["answer"],
-        },
-    },
-]
 
 
 class SlackInterface(BaseInterface):
@@ -114,9 +77,11 @@ class SlackInterface(BaseInterface):
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
         from agentforge.core.checkpoint import init_checkpointer
         from agentforge.core.context_store import init_context_store
+        from agentforge.core.global_context import init_global_context_store
 
         await init_checkpointer()
         await init_context_store()
+        await init_global_context_store()
 
         self._app = AsyncApp(
             token=self._bot_token,
@@ -355,6 +320,26 @@ class SlackInterface(BaseInterface):
             await ack()
             await self._on_l4_action(body, resume_value="abort")
 
+        @app.action("l2_upgrade")
+        async def handle_l2_upgrade(body: dict, ack: Any) -> None:
+            await ack()
+            await self._on_l2_action(body, choice="upgrade")
+
+        @app.action("l2_stop")
+        async def handle_l2_stop(body: dict, ack: Any) -> None:
+            await ack()
+            await self._on_l2_action(body, choice="stop")
+
+        @app.action("plan_approve")
+        async def handle_plan_approve(body: dict, ack: Any) -> None:
+            await ack()
+            await self._on_plan_action(body, action="approved")
+
+        @app.action("plan_modify")
+        async def handle_plan_modify(body: dict, ack: Any) -> None:
+            await ack()
+            await self._on_plan_action(body, action="modify_request")
+
     # ------------------------------------------------------------------
     # Clarification flow
     # ------------------------------------------------------------------
@@ -375,10 +360,27 @@ class SlackInterface(BaseInterface):
         # Mention inside an existing thread — route by stage
         if existing:
             stage = existing.get("stage", "")
+            logger.info(
+                "[mention] thread=%s stage=%s session=%s → routing to %s handler",
+                thread_ts[:12], stage,
+                str(existing.get("session_id", ""))[:8] or "none",
+                "running" if stage == "running" else
+                "completed" if stage == "completed" else
+                "clarifying" if stage in ("clarifying", "confirming") else
+                stage,
+            )
             if stage == "running":
-                session_id = existing.get("session_id", "")
+                if request:
+                    task = asyncio.create_task(
+                        self._dispatch_running_thread(
+                            self._app.client, existing, request, channel, thread_ts
+                        )
+                    )
+                    task.add_done_callback(self._on_task_done)
+                return
+            if stage == "l2_waiting":
                 await say(
-                    text=f"세션 `{session_id[:8]}`이 실행 중입니다. 완료되면 알림을 드립니다.",
+                    text="위 버튼으로 업그레이드 승인 또는 작업 중단을 선택해 주세요.",
                     thread_ts=thread_ts,
                 )
                 return
@@ -388,8 +390,33 @@ class SlackInterface(BaseInterface):
                     thread_ts=thread_ts,
                 )
                 return
+            if stage == "plan_waiting":
+                await say(
+                    text="계획서 버튼으로 승인 또는 수정 요청을 해주세요.",
+                    thread_ts=thread_ts,
+                )
+                return
+            if stage == "plan_modify_waiting":
+                session_id_val = existing.get("session_id", "")
+                pending = self._pending_l4.get(session_id_val)
+                if request.strip() and pending:
+                    existing["stage"] = "running"
+                    self._pending_clarification[thread_ts] = existing
+                    await self._persist(thread_ts)
+                    asyncio.create_task(
+                        self._resume_graph(
+                            pending["graph"], pending["config"],
+                            {"action": "modify", "feedback": request.strip()},
+                            channel, thread_ts, session_id_val,
+                        )
+                    )
+                else:
+                    await say(
+                        text="수정 내용을 이 스레드에 답장해 주세요.",
+                        thread_ts=thread_ts,
+                    )
+                return
             if stage == "completed":
-                # Let the LLM decide the action via tool calling
                 if request:
                     task = asyncio.create_task(
                         self._dispatch_completed_thread(
@@ -398,11 +425,13 @@ class SlackInterface(BaseInterface):
                     )
                     task.add_done_callback(self._on_task_done)
                 return
-            elif stage in ("clarifying", "confirming"):
+            if stage in ("clarifying", "confirming"):
+                # @mention in a clarifying thread → LeaderAgent decides intent.
+                # Plain replies (no mention) go through _handle_clarification_reply directly.
                 if request:
                     task = asyncio.create_task(
-                        self._handle_clarification_reply(
-                            self._app.client, channel, thread_ts, request
+                        self._dispatch_clarifying_thread(
+                            self._app.client, existing, request, channel, thread_ts, user_id
                         )
                     )
                     task.add_done_callback(self._on_task_done)
@@ -412,6 +441,7 @@ class SlackInterface(BaseInterface):
             await say(text="요청 내용을 입력해 주세요.", thread_ts=thread_ts)
             return
 
+        logger.info("[mention] new thread — starting clarification for user=%s", user_id)
         # Complaint detection
         if any(kw in request for kw in self.COMPLAINT_KEYWORDS):
             asyncio.create_task(
@@ -460,6 +490,22 @@ class SlackInterface(BaseInterface):
             # else: wait for button click
             return
 
+        if stage == "plan_modify_waiting":
+            session_id_val = state.get("session_id", "")
+            pending = self._pending_l4.get(session_id_val)
+            if user_text.strip() and pending:
+                state["stage"] = "running"
+                self._pending_clarification[thread_ts] = state
+                await self._persist(thread_ts)
+                asyncio.create_task(
+                    self._resume_graph(
+                        pending["graph"], pending["config"],
+                        {"action": "modify", "feedback": user_text.strip()},
+                        channel, thread_ts, session_id_val,
+                    )
+                )
+            return
+
         # stage == "clarifying"
         state["history"].append({"role": "user", "content": user_text})
         await self._persist(thread_ts)
@@ -483,11 +529,26 @@ class SlackInterface(BaseInterface):
             result = await agent.next_turn(state["history"])
         except Exception as exc:
             logger.exception("ClarifierAgent error: %s", exc)
+            exc_str = str(exc)
+            if "529" in exc_str or "overloaded" in exc_str.lower():
+                msg = (
+                    "Anthropic API가 일시적으로 과부하 상태입니다. "
+                    "잠시 후 메시지를 다시 보내주시면 재시도합니다."
+                )
+            elif "429" in exc_str or "rate_limit" in exc_str.lower():
+                msg = (
+                    "API 요청 한도에 도달했습니다. "
+                    "잠시 후 메시지를 다시 보내주시면 재시도합니다."
+                )
+            else:
+                msg = (
+                    f"요구사항 분석 중 오류가 발생했습니다. "
+                    f"메시지를 다시 보내주시면 재시도합니다. (`{exc_str[:120]}`)"
+                )
             await client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f"요구사항 분석 중 오류: {exc}"
+                channel=channel, thread_ts=thread_ts, text=msg,
             )
-            await self._delete_thread(thread_ts)
+            # Keep thread in clarifying stage so user can retry without re-mentioning
             return
 
         if result.get("status") == "ready":
@@ -547,6 +608,11 @@ class SlackInterface(BaseInterface):
         summary    = state.get("summary") or state["request"]
         session_id = str(uuid.uuid4())
 
+        logger.info(
+            "[execute_graph] thread=%s session=%s summary=%.120s",
+            thread_ts[:12], session_id[:8], summary,
+        )
+
         # Transition to "running" stage and persist
         state["stage"]      = "running"
         state["session_id"] = session_id
@@ -575,14 +641,15 @@ class SlackInterface(BaseInterface):
     async def stream_graph_to_slack(
         self,
         graph: Any,
-        initial_state: Optional[dict],
+        initial_state,  # Optional[dict | Command] — None resumes from checkpoint
         channel: str,
         thread_ts: str,
         session_id: str,
     ) -> None:
         """
         Stream graph events to Slack thread.
-        Pass initial_state=None to resume from an existing checkpoint (after restart).
+        - Pass initial_state=None to resume from existing checkpoint.
+        - Pass Command(resume=value) to resume from an interrupt node.
         """
         config     = {"configurable": {"thread_id": session_id}}
         status_ts: Optional[str] = None
@@ -594,6 +661,9 @@ class SlackInterface(BaseInterface):
                 status_ts = resp.get("ts")
             else:
                 await self.update_message(channel, status_ts, text)
+
+        from agentforge.observer.historian import Historian
+        historian = Historian()
 
         logger.info("Graph streaming started: session=%s", session_id[:8])
         final_report = ""
@@ -609,36 +679,204 @@ class SlackInterface(BaseInterface):
                     logger.info("[%s] node start: %s", session_id[:8], node_name)
                     await _post_or_update(f"`{node_name}` 실행 중...")
 
-                elif event_name == "on_chain_end" and node_name == "interrupt_l4":
-                    data    = event.get("data", {})
-                    task_id = data.get("output", {}).get("current_task_id", "?")
-                    summary = data.get("output", {}).get("final_report", "수동 개입 필요")
+                elif event_name == "on_chain_end" and node_name == "dispatch_workers":
+                    output = event.get("data", {}).get("output", {}) or {}
+                    dag_index  = output.get("dag_index", {})
+                    task_nodes = output.get("task_nodes", {})
 
-                    # Persist L4 stage
-                    state = self._pending_clarification.get(thread_ts, {})
-                    state.update({"stage": "l4_waiting", "task_id": task_id})
-                    self._pending_clarification[thread_ts] = state
-                    await self._persist(thread_ts)
+                    total     = len(dag_index)
+                    n_done    = sum(1 for s in dag_index.values() if "completed" in str(s).lower())
+                    n_failed  = sum(1 for s in dag_index.values() if str(s).lower() in ("taskstatus.failed", "failed", "taskstatus.blocked", "blocked"))
 
-                    self._pending_l4[session_id] = {
-                        "channel": channel,
-                        "thread_ts": thread_ts,
-                        "graph": graph,
-                        "config": config,
-                        "task_id": task_id,
-                    }
-                    await self.send_l4_prompt(channel, thread_ts, task_id, str(summary))
-                    return
+                    for tid, status in dag_index.items():
+                        status_s = str(status).lower()
+                        if not any(x in status_s for x in ("completed", "failed", "blocked")):
+                            continue  # pending/running: 아직 보고 대상 아님
+                        node_obj = task_nodes.get(tid)
+                        report = (node_obj.get("report") if isinstance(node_obj, dict)
+                                  else getattr(node_obj, "report", None)) if node_obj else None
+                        if not report:
+                            continue
+
+                        rsum = (report.get("summary", "") if isinstance(report, dict) else getattr(report, "summary", ""))
+                        rdur = (report.get("duration_seconds", 0) if isinstance(report, dict) else getattr(report, "duration_seconds", 0))
+                        rtok = (report.get("tokens_used", 0) if isinstance(report, dict) else getattr(report, "tokens_used", 0))
+                        deliverables = (report.get("deliverables", []) if isinstance(report, dict) else getattr(report, "deliverables", []))
+
+                        is_completed = "completed" in status_s
+                        icon = "✅" if is_completed else "❌"
+
+                        # 이 태스크 완료로 unblock 될 다음 태스크
+                        newly_ready = []
+                        if is_completed:
+                            for dep_tid, dep_node in task_nodes.items():
+                                deps = (dep_node.get("instruction", {}).get("depends_on", []) if isinstance(dep_node, dict)
+                                        else getattr(dep_node.instruction, "depends_on", []))
+                                dep_status = str(dag_index.get(dep_tid, "")).lower()
+                                if tid in deps and "pending" in dep_status:
+                                    newly_ready.append(dep_tid)
+
+                        lines = [
+                            f"{icon} **{tid}** ({n_done}/{total} 완료) — {rdur:.0f}초, {rtok:,}토큰",
+                            f"*요약*: {str(rsum)[:200]}",
+                        ]
+                        if deliverables:
+                            lines.append("*생성 파일*:\n" + "\n".join(f"  • `{f}`" for f in deliverables[:10]))
+                        if newly_ready:
+                            lines.append(f"*다음 실행 예정*: {', '.join(f'`{t}`' for t in newly_ready)}")
+                        elif n_done + n_failed >= total:
+                            lines.append("*모든 작업 처리 완료 — 검증 단계로 이동합니다*")
+
+                        await self.send_message(channel, "\n".join(lines), thread_ts=thread_ts)
+
+                        asyncio.create_task(historian.record_event(
+                            session_id=session_id,
+                            node="dispatch_workers",
+                            task_id=tid,
+                            result="success" if is_completed else "failed",
+                            elapsed_s=float(rdur) if rdur else 0.0,
+                            tokens=int(rtok) if rtok else 0,
+                        ))
+
+                elif event_name == "on_chain_end" and node_name == "escalate":
+                    output = event.get("data", {}).get("output", {}) or {}
+                    level   = output.get("current_escalation_level", 0)
+                    history = output.get("escalation_history", [])
+                    last    = history[-1] if history else {}
+                    task_id = last.get("task_id", "?")
+                    if level == 1:
+                        msg = f"🔄 재시도 1회차: `{task_id}` — 동일 모델로 재시도합니다..."
+                    elif level == 2:
+                        msg = f"🔄 재시도 2회차: `{task_id}` — 마지막 자동 재시도입니다. 실패 시 승인 요청합니다..."
+                    elif level == 3:
+                        msg = f"⬆️ 모델 업그레이드: `{task_id}` — 상위 에이전트로 재시도합니다..."
+                    elif level >= 4:
+                        msg = f"🚨 최대 재시도 초과: `{task_id}` — 수동 개입이 필요합니다"
+                    else:
+                        msg = f"⚠️ 에스컬레이션 L{level}: `{task_id}`"
+                    await self.send_message(channel, msg, thread_ts=thread_ts)
+                    asyncio.create_task(historian.record_event(
+                        session_id=session_id,
+                        node=f"escalate_L{level}",
+                        task_id=task_id,
+                        result="escalate",
+                        elapsed_s=0.0,
+                        tokens=0,
+                    ))
+
+                elif event_name == "on_chain_end" and node_name == "verify_ci":
+                    output = event.get("data", {}).get("output", {}) or {}
+                    ci_passed = output.get("ci_passed", True)
+                    task_id   = output.get("current_task_id", "")
+                    if task_id:
+                        icon = "✅ CI 통과" if ci_passed else "❌ CI 실패"
+                        logger.info("[%s] %s: %s", session_id[:8], icon, task_id)
+
+                elif event_name == "on_chain_end" and node_name == "verify_semantic":
+                    output  = event.get("data", {}).get("output", {}) or {}
+                    verdict = (output.get("semantic_result") or {}).get("verdict", "")
+                    if verdict:
+                        icon = "✅ 검증 통과" if verdict == "ACCEPT" else "❌ 검증 거부"
+                        logger.info("[%s] %s", session_id[:8], icon)
 
                 elif event_name == "on_chain_end" and node_name == "finalize":
                     output = event.get("data", {}).get("output", {})
                     final_report = output.get("final_report", "완료")
                     await _post_or_update(f"완료\n\n{final_report}")
+                    asyncio.create_task(historian.record_event(
+                        session_id=session_id,
+                        node="finalize",
+                        task_id="-",
+                        result="success",
+                        elapsed_s=0.0,
+                        tokens=0,
+                    ))
 
         except Exception as exc:
             logger.exception("Graph streaming error: %s", exc)
             error_msg = str(exc)
             await _post_or_update(f"오류 발생: {exc}")
+        else:
+            # Stream ended cleanly without a final_report — check if paused at interrupt
+            if not final_report:
+                try:
+                    snap = await graph.aget_state(config)
+                    next_nodes = list(snap.next) if snap and snap.next else []
+
+                    if "interrupt_l2" in next_nodes:
+                        gs = snap.values or {}
+                        task_id_l2 = gs.get("current_task_id", "unknown")
+                        task_nodes_snap = gs.get("task_nodes", {})
+                        node_snap = task_nodes_snap.get(task_id_l2)
+                        if node_snap:
+                            tier = getattr(node_snap.instruction, "model_tier", None)
+                            current_tier = str(tier) if tier else "haiku"
+                        else:
+                            current_tier = "haiku"
+                        from agentforge.graph.nodes import _upgrade_tier
+                        from agentforge.core.models import ModelTier
+                        try:
+                            tier_enum = ModelTier(current_tier)
+                        except ValueError:
+                            tier_enum = ModelTier.HAIKU
+                        next_tier = str(_upgrade_tier(tier_enum))
+
+                        thread_state = self._pending_clarification.get(thread_ts, {})
+                        thread_state.update({"stage": "l2_waiting", "task_id": task_id_l2, "session_id": session_id})
+                        self._pending_clarification[thread_ts] = thread_state
+                        await self._persist(thread_ts)
+
+                        self._pending_l4[session_id] = {
+                            "channel": channel, "thread_ts": thread_ts,
+                            "graph": graph, "config": config,
+                            "task_id": task_id_l2, "interrupt_type": "l2",
+                        }
+                        await self._app.client.chat_postMessage(
+                            channel=channel, thread_ts=thread_ts,
+                            blocks=_build_l2_blocks(session_id, task_id_l2, current_tier, next_tier),
+                        )
+                        return
+
+                    elif "interrupt_l4" in next_nodes:
+                        gs = snap.values or {}
+                        task_id_l4 = gs.get("current_task_id", "?")
+                        final_rpt  = gs.get("final_report", "수동 개입 필요")
+                        state_obj = self._pending_clarification.get(thread_ts, {})
+                        state_obj.update({"stage": "l4_waiting", "task_id": task_id_l4})
+                        self._pending_clarification[thread_ts] = state_obj
+                        await self._persist(thread_ts)
+                        self._pending_l4[session_id] = {
+                            "channel": channel, "thread_ts": thread_ts,
+                            "graph": graph, "config": config, "task_id": task_id_l4,
+                        }
+                        await self.send_l4_prompt(channel, thread_ts, task_id_l4, str(final_rpt))
+                        return
+
+                    elif "present_plan" in next_nodes:
+                        gs = snap.values or {}
+                        ws_root = gs.get("workspace_root", "")
+                        plan_md = ""
+                        if ws_root:
+                            from pathlib import Path as _Path
+                            plan_path = _Path(ws_root) / "PLAN.md"
+                            if plan_path.exists():
+                                plan_md = plan_path.read_text(encoding="utf-8")
+                        thread_state = self._pending_clarification.get(thread_ts, {})
+                        thread_state.update({"stage": "plan_waiting", "session_id": session_id})
+                        self._pending_clarification[thread_ts] = thread_state
+                        await self._persist(thread_ts)
+                        self._pending_l4[session_id] = {
+                            "channel": channel, "thread_ts": thread_ts,
+                            "graph": graph, "config": config, "interrupt_type": "plan",
+                        }
+                        await self._app.client.chat_postMessage(
+                            channel=channel, thread_ts=thread_ts,
+                            text="작업 계획서가 준비됐습니다. 검토 후 승인해 주세요.",
+                            blocks=_build_plan_blocks(session_id, plan_md),
+                        )
+                        return
+                except Exception as _snap_exc:
+                    logger.warning("Failed to check graph interrupt state: %s", _snap_exc)
         finally:
             # Keep thread context as "completed" so follow-up questions work.
             # The summary field holds the final report for context.
@@ -651,14 +889,52 @@ class SlackInterface(BaseInterface):
                 "session_id": session_id,
                 "task_id": None,
             }
-            state["stage"]   = "completed"
-            state["summary"] = final_report or (f"오류: {error_msg}" if error_msg else "")
+            # Don't overwrite interrupt-waiting stages that were set by early returns above.
+            _interrupt_stages = {"l2_waiting", "l4_waiting", "plan_waiting", "plan_modify_waiting"}
+            if state.get("stage") not in _interrupt_stages:
+                state["stage"] = "completed"
+            state["result"] = final_report or (f"오류: {error_msg}" if error_msg else "")
+            # "summary" retains the clarified requirements — do not overwrite
             self._pending_clarification[thread_ts] = state
             await self._persist(thread_ts)
+
+            # Update cross-session global context
+            try:
+                from agentforge.core.global_context import get_global_context_store
+                await get_global_context_store().record_session(
+                    session_id=session_id,
+                    success=bool(final_report and not error_msg),
+                    summary=state.get("summary", ""),
+                    result=state["result"],
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # L4 escalation
     # ------------------------------------------------------------------
+
+    async def _on_l2_action(self, body: dict, choice: str) -> None:
+        action     = body.get("actions", [{}])[0]
+        session_id = action.get("value", "")
+        pending    = self._pending_l4.pop(session_id, None)
+        if pending is None:
+            return
+
+        channel   = pending["channel"]
+        thread_ts = pending["thread_ts"]
+        graph     = pending["graph"]
+        config    = pending["config"]
+
+        if choice == "upgrade":
+            label = "✅ 업그레이드 승인 — 더 높은 수준의 에이전트로 재시도합니다"
+        else:
+            label = "❌ 작업 중단"
+        await self.send_message(channel, label, thread_ts=thread_ts)
+
+        asyncio.create_task(
+            self._resume_graph(graph, config, {"choice": choice}, channel, thread_ts, session_id)
+        )
 
     async def _on_l4_action(self, body: dict, resume_value: str) -> None:
         action     = body.get("actions", [{}])[0]
@@ -679,47 +955,155 @@ class SlackInterface(BaseInterface):
             self._resume_graph(graph, config, resume_value, channel, thread_ts, session_id)
         )
 
+    async def _on_plan_action(self, body: dict, action: str) -> None:
+        action_data = body.get("actions", [{}])[0]
+        session_id  = action_data.get("value", "")
+        pending     = self._pending_l4.get(session_id)
+        if pending is None:
+            return
+
+        channel   = pending["channel"]
+        thread_ts = pending["thread_ts"]
+        graph     = pending["graph"]
+        config    = pending["config"]
+
+        if action == "approved":
+            self._pending_l4.pop(session_id, None)
+            thread_state = self._pending_clarification.get(thread_ts, {})
+            thread_state["stage"] = "running"
+            self._pending_clarification[thread_ts] = thread_state
+            await self._persist(thread_ts)
+            await self.send_message(channel, "✅ 계획 승인 — 작업을 시작합니다...", thread_ts=thread_ts)
+            asyncio.create_task(
+                self._resume_graph(graph, config, "approved", channel, thread_ts, session_id)
+            )
+        else:
+            # modify_request — ask user to reply with modification details
+            thread_state = self._pending_clarification.get(thread_ts, {})
+            thread_state.update({"stage": "plan_modify_waiting", "session_id": session_id})
+            self._pending_clarification[thread_ts] = thread_state
+            await self._persist(thread_ts)
+            await self.send_message(
+                channel,
+                "✏️ 수정 내용을 이 스레드에 답장해 주세요.",
+                thread_ts=thread_ts,
+            )
+
     async def _resume_graph(
-        self, graph: Any, config: dict, resume_value: str,
+        self, graph: Any, config: dict, resume_value,
         channel: str, thread_ts: str, session_id: str,
     ) -> None:
         from langgraph.types import Command
-
-        async def _post(text: str) -> None:
-            await self.send_message(channel, text, thread_ts=thread_ts)
-
-        final_report = ""
-        error_msg    = ""
-        try:
-            async for event in graph.astream_events(
-                Command(resume=resume_value), config=config, version="v2"
-            ):
-                event_name = event.get("event", "")
-                node_name  = event.get("name", "")
-                if event_name == "on_chain_end" and node_name == "finalize":
-                    output = event.get("data", {}).get("output", {})
-                    final_report = output.get("final_report", "완료")
-                    await _post(f"완료\n\n{final_report}")
-        except Exception as exc:
-            error_msg = str(exc)
-            await _post(f"재개 중 오류: {exc}")
-        finally:
-            state = self._pending_clarification.get(thread_ts) or {
-                "thread_ts": thread_ts,
-                "channel": channel,
-                "user_id": "",
-                "request": "",
-                "history": [],
-                "session_id": session_id,
-                "task_id": None,
-            }
-            state["stage"]   = "completed"
-            state["summary"] = final_report or (f"오류: {error_msg}" if error_msg else "")
-            self._pending_clarification[thread_ts] = state
-            await self._persist(thread_ts)
+        await self.stream_graph_to_slack(
+            graph, Command(resume=resume_value), channel, thread_ts, session_id
+        )
 
     # ------------------------------------------------------------------
-    # Completed-thread dispatcher (tool calling)
+    # Session resume
+    # ------------------------------------------------------------------
+
+    async def _resume_from_checkpoint(
+        self, client: Any, state: dict, channel: str, thread_ts: str,
+        override_session_id: str = "",
+    ) -> None:
+        """Resume an existing session: keep COMPLETED tasks, reset FAILED/BLOCKED to PENDING."""
+        session_id = override_session_id or state.get("session_id", "")
+        if not session_id:
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text="재개할 세션을 찾을 수 없습니다. '새 작업 시작'을 요청해 주세요.",
+            )
+            return
+
+        from agentforge.core.models import EscalationLevel, TaskStatus
+
+        graph = _build_graph()
+        config = {"configurable": {"thread_id": session_id}}
+        snap = await graph.aget_state(config)
+
+        if snap is None or not snap.values:
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f"세션 `{session_id[:8]}`의 체크포인트를 찾을 수 없습니다. 처음부터 재시작합니다...",
+            )
+            state["result"] = None
+            await self._execute_graph(client, state)
+            return
+
+        chk_values = snap.values
+        dag_index  = dict(chk_values.get("dag_index",  {}))
+        task_nodes = dict(chk_values.get("task_nodes", {}))
+
+        if not dag_index:
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text="DAG 진행 상태가 없습니다. 처음부터 재시작합니다...",
+            )
+            state["result"] = None
+            await self._execute_graph(client, state)
+            return
+
+        # Reset failed/blocked tasks to PENDING
+        terminal = {TaskStatus.FAILED, TaskStatus.BLOCKED}
+        reset_ids: list[str] = []
+        for tid, status in list(dag_index.items()):
+            if status in terminal:
+                dag_index[tid] = TaskStatus.PENDING
+                node = task_nodes.get(tid)
+                if node is not None:
+                    try:
+                        node = node.model_copy(update={
+                            "status": TaskStatus.PENDING,
+                            "escalation_level": EscalationLevel.L0,
+                            "report": None,
+                            "assigned_agent_id": None,
+                        })
+                        task_nodes[tid] = node
+                    except Exception:
+                        pass
+                reset_ids.append(tid)
+
+        completed_count = sum(1 for s in dag_index.values() if s == TaskStatus.COMPLETED)
+        total = len(dag_index)
+
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=(
+                f"세션 `{session_id[:8]}` 재개 중...\n"
+                f"완료 작업 {completed_count}/{total}개 유지"
+                + (f", 재시도 예정: {', '.join(f'`{t}`' for t in reset_ids)}" if reset_ids else "")
+            ),
+        )
+
+        # Inject modified state continuing from after build_dag
+        resume_values = {
+            **{k: v for k, v in chk_values.items()
+               if k not in ("dag_index", "task_nodes", "current_escalation_level",
+                            "failing_task_id", "semantic_result", "ci_result", "ci_passed",
+                            "current_task_id", "delegated_task_ids")},
+            "dag_index": dag_index,
+            "task_nodes": task_nodes,
+            "current_escalation_level": 0,
+            "failing_task_id": None,
+            "semantic_result": None,
+            "ci_passed": True,
+            "current_task_id": None,
+            "delegated_task_ids": [],
+        }
+        await graph.aupdate_state(config, resume_values, as_node="build_dag")
+
+        state["stage"] = "running"
+        state["session_id"] = session_id
+        self._pending_clarification[thread_ts] = state
+        await self._persist(thread_ts)
+
+        task = asyncio.create_task(
+            self.stream_graph_to_slack(graph, None, channel, thread_ts, session_id)
+        )
+        task.add_done_callback(self._on_task_done)
+
+    # ------------------------------------------------------------------
+    # Completed / running thread dispatchers (tool calling)
     # ------------------------------------------------------------------
 
     async def _dispatch_completed_thread(
@@ -731,74 +1115,47 @@ class SlackInterface(BaseInterface):
         thread_ts: str,
         user_id: str,
     ) -> None:
-        """
-        Use tool calling so the LLM can choose between:
-          - start_new_task  : restart or modify the task
-          - answer_question : explain results, analyse failure, etc.
-        """
-        original_request = state.get("request", "")
-        final_report     = state.get("summary", "")
-        session_id       = state.get("session_id", "")
+        """Delegate to LeaderAgent tool calling (allow_actions=True)."""
+        from agentforge.agents.leader import LeaderAgent
 
-        thread_text = await self._fetch_thread_messages(client, channel, thread_ts)
-
-        context = (
-            f"## 원래 요청\n{original_request}\n\n"
-            f"## 최종 작업 보고서 (세션 {session_id[:8] if session_id else '?'})\n"
-            f"{final_report}\n\n"
-            f"## 스레드 대화 내역\n{thread_text}\n\n"
-            f"## 사용자 메시지\n{user_message}"
+        logger.info(
+            "[dispatch_completed] thread=%s session=%s user_text=%.80s",
+            thread_ts[:12],
+            str(state.get("session_id", ""))[:8] or "none",
+            user_message,
         )
+        # Inject Slack thread history and global context so the LLM has full context
+        thread_text  = await self._fetch_thread_messages(client, channel, thread_ts)
+        global_ctx   = await self._load_global_context_str()
+        enriched_state = {**state, "thread_messages": thread_text, "_global_context": global_ctx}
 
-        try:
-            import anthropic
-            from agentforge.core.models import MODEL_IDS, ModelTier
+        async def post(text: str) -> None:
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
 
-            ai = anthropic.AsyncAnthropic()
-            response = await ai.messages.create(
-                model=MODEL_IDS[ModelTier.SONNET],
-                max_tokens=1024,
-                tools=_COMPLETED_THREAD_TOOLS,
-                system=(
-                    "당신은 AgentForge 소프트웨어 개발 AI 시스템의 어시스턴트입니다.\n"
-                    "제공된 작업 보고서와 스레드 대화 내역을 보고, 사용자 메시지의 의도에 맞는 도구를 선택하세요.\n"
-                    "- 작업 재시작/재시도/수정/개선 요청 → start_new_task\n"
-                    "- 결과 설명, 실패 원인 분석, 상태 확인 등 질문 → answer_question\n"
-                    "반드시 도구를 호출하세요. 텍스트 응답만 하지 마세요."
-                ),
-                messages=[{"role": "user", "content": context}],
-            )
-        except Exception as exc:
-            logger.exception("Dispatch completed thread error: %s", exc)
+        async def on_retry(requirements: str = "") -> None:
+            """Restart with confirmed requirements — fall back to clarification if none confirmed."""
+            confirmed_summary = requirements.strip() or state.get("summary", "")
+            if not confirmed_summary:
+                await client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text="아직 요구사항이 확정되지 않았습니다. 명확화를 다시 진행합니다...",
+                )
+                state["stage"] = "clarifying"
+                await self._persist(thread_ts)
+                await self._run_clarification_turn(client, channel, thread_ts)
+                return
+            state["summary"] = confirmed_summary
             await client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
-                text=f"요청 처리 중 오류가 발생했습니다: {exc}"
+                text="이전 요구사항으로 작업을 재시도합니다...",
             )
-            return
+            state["result"] = None
+            await self._execute_graph(client, state)
 
-        # Process tool call
-        tool_use_block = next(
-            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
-            None,
-        )
-
-        if tool_use_block is None:
-            # Model returned text without calling a tool — show it as-is
-            text = " ".join(
-                getattr(b, "text", "") for b in response.content
-                if getattr(b, "type", None) == "text"
-            ).strip()
-            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text or "처리할 수 없습니다.")
-            return
-
-        tool_name  = tool_use_block.name
-        tool_input = tool_use_block.input or {}
-        logger.info("Completed-thread tool selected: %s (thread=%s)", tool_name, thread_ts[:12])
-
-        if tool_name == "start_new_task":
-            new_request = tool_input.get("request", "").strip() or original_request
+        async def on_start(request: str) -> None:
+            original_request = state.get("summary") or state.get("request", "")
+            new_request = request.strip() or original_request
             await self._delete_thread(thread_ts)
-            # Synthesize a fresh mention event by directly starting clarification
             fresh_state: dict = {
                 "channel": channel,
                 "thread_ts": thread_ts,
@@ -814,9 +1171,144 @@ class SlackInterface(BaseInterface):
             await self._persist(thread_ts)
             await self._run_clarification_turn(client, channel, thread_ts)
 
-        elif tool_name == "answer_question":
-            answer = tool_input.get("answer", "답변을 생성할 수 없습니다.")
-            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=answer)
+        async def on_resume(session_id: str = "") -> None:
+            await self._resume_from_checkpoint(
+                client, state, channel, thread_ts,
+                override_session_id=session_id,
+            )
+
+        agent = LeaderAgent()
+        await agent.dispatch_user_message(
+            user_message=user_message,
+            thread_state=enriched_state,
+            allow_actions=True,
+            post_fn=post,
+            on_start_new_task=on_start,
+            on_retry_session=on_retry,
+            on_resume_session=on_resume,
+            on_delete_thread=lambda: self._delete_thread(thread_ts),
+        )
+
+    async def _dispatch_running_thread(
+        self,
+        client: Any,
+        state: dict,
+        user_message: str,
+        channel: str,
+        thread_ts: str,
+    ) -> None:
+        """Delegate to LeaderAgent tool calling (allow_actions=False — read-only)."""
+        from agentforge.agents.leader import LeaderAgent
+
+        logger.info(
+            "[dispatch_running] thread=%s session=%s user_text=%.80s",
+            thread_ts[:12],
+            str(state.get("session_id", ""))[:8] or "none",
+            user_message,
+        )
+        global_ctx = await self._load_global_context_str()
+        enriched_state = {**state, "_global_context": global_ctx}
+
+        async def post(text: str) -> None:
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+        agent = LeaderAgent()
+        await agent.dispatch_user_message(
+            user_message=user_message,
+            thread_state=enriched_state,
+            allow_actions=False,
+            post_fn=post,
+            on_start_new_task=None,
+            on_delete_thread=None,
+        )
+
+    async def _dispatch_clarifying_thread(
+        self,
+        client: Any,
+        state: dict,
+        user_message: str,
+        channel: str,
+        thread_ts: str,
+        user_id: str,
+    ) -> None:
+        """
+        Handle @mention in a clarifying/confirming thread via LeaderAgent tool calling.
+
+        The LLM sees the full Slack thread history and chooses:
+          - retry_current_session  : skip clarification, use confirmed requirements
+          - start_new_task         : clear state, restart with new requirements
+          - continue_clarification : pass message to ClarifierAgent and proceed normally
+          - answer_question        : answer a question without changing state
+          - QUERY_TOOLS            : look up session progress, logs, etc.
+        """
+        from agentforge.agents.leader import LeaderAgent
+
+        logger.info(
+            "[dispatch_clarifying] thread=%s stage=%s session=%s user_text=%.80s",
+            thread_ts[:12],
+            state.get("stage", "?"),
+            str(state.get("session_id", ""))[:8] or "none",
+            user_message,
+        )
+        thread_text = await self._fetch_thread_messages(client, channel, thread_ts)
+        global_ctx  = await self._load_global_context_str()
+        enriched_state = {**state, "thread_messages": thread_text, "_global_context": global_ctx}
+
+        async def post(text: str) -> None:
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+        async def on_retry(requirements: str = "") -> None:
+            confirmed_summary = requirements.strip() or state.get("summary", "")
+            if not confirmed_summary:
+                await client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text="아직 요구사항이 확정되지 않았습니다. 명확화를 다시 진행합니다...",
+                )
+                await self._run_clarification_turn(client, channel, thread_ts)
+                return
+            state["summary"] = confirmed_summary
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text="요구사항을 확인했습니다. 명확화 단계를 건너뛰고 바로 작업을 시작합니다...",
+            )
+            state["result"] = None
+            await self._execute_graph(client, state)
+
+        async def on_start(request: str) -> None:
+            new_request = request.strip() or state.get("request", "")
+            await self._delete_thread(thread_ts)
+            fresh_state: dict = {
+                "channel": channel, "thread_ts": thread_ts, "user_id": user_id,
+                "request": new_request,
+                "history": [{"role": "user", "content": new_request}],
+                "stage": "clarifying", "summary": None, "session_id": None, "task_id": None,
+            }
+            self._pending_clarification[thread_ts] = fresh_state
+            await self._persist(thread_ts)
+            await self._run_clarification_turn(client, channel, thread_ts)
+
+        async def on_continue(message: str) -> None:
+            """Route back to ClarifierAgent with the clarification message."""
+            await self._handle_clarification_reply(client, channel, thread_ts, message)
+
+        async def on_resume(session_id: str = "") -> None:
+            await self._resume_from_checkpoint(
+                client, state, channel, thread_ts,
+                override_session_id=session_id,
+            )
+
+        agent = LeaderAgent()
+        await agent.dispatch_user_message(
+            user_message=user_message,
+            thread_state=enriched_state,
+            allow_actions=True,
+            post_fn=post,
+            on_start_new_task=on_start,
+            on_retry_session=on_retry,
+            on_resume_session=on_resume,
+            on_continue_clarification=on_continue,
+            on_delete_thread=lambda: self._delete_thread(thread_ts),
+        )
 
     async def _fetch_thread_messages(
         self, client: Any, channel: str, thread_ts: str, limit: int = 30
@@ -875,6 +1367,13 @@ class SlackInterface(BaseInterface):
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
+
+    async def _load_global_context_str(self) -> str:
+        try:
+            from agentforge.core.global_context import get_global_context_store
+            return await get_global_context_store().get_formatted()
+        except Exception:
+            return ""
 
     async def _persist(self, thread_ts: str) -> None:
         """Persist the current in-memory state for thread_ts to SQLite."""
@@ -950,6 +1449,56 @@ def _build_confirmation_blocks(summary: str, thread_ts: str) -> list[dict]:
                     "style": "danger",
                     "action_id": "clarify_cancel",
                     "value": thread_ts,
+                },
+            ],
+        },
+    ]
+
+
+def _build_l2_blocks(session_id: str, task_id: str, current_tier: str, next_tier: str) -> list[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": (
+                f"⚠️ *{task_id}* 작업이 2회 재시도 후에도 실패했습니다.\n"
+                f"현재 모델: `{current_tier}` → 업그레이드: `{next_tier}`\n\n"
+                "더 높은 수준의 에이전트를 사용할까요? (추가 비용 발생)"
+            )},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "✅ 업그레이드 승인"},
+                 "style": "primary", "action_id": "l2_upgrade", "value": session_id},
+                {"type": "button", "text": {"type": "plain_text", "text": "❌ 작업 중단"},
+                 "style": "danger", "action_id": "l2_stop", "value": session_id},
+            ],
+        },
+    ]
+
+
+def _build_plan_blocks(session_id: str, plan_md: str) -> list[dict]:
+    plan_text = plan_md[:2900] if plan_md else "(계획서를 불러올 수 없습니다)"
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": plan_text},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ 계획 승인"},
+                    "style": "primary",
+                    "action_id": "plan_approve",
+                    "value": session_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ 수정 요청"},
+                    "action_id": "plan_modify",
+                    "value": session_id,
                 },
             ],
         },

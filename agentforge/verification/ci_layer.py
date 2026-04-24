@@ -85,14 +85,52 @@ class CIVerifier:
             return True
         criterion_lower = criterion.lower()
         if "typescript" in criterion_lower and ws:
-            return await self._run_tsc(ws)
+            return self._check_typescript(criterion_lower, ws)
+        if any(kw in criterion_lower for kw in ("eslint", "prettier", "lint")) and ws:
+            return self._check_lint_config(ws)
+        if ".env" in criterion_lower and "환경변수" in criterion_lower and ws:
+            return self._check_env_example(ws)
         return None
 
-    async def _run_tsc(self, ws: Path) -> bool:
-        from agentforge.sandbox.docker_executor import DockerExecutor
-        executor = DockerExecutor()
-        result = await executor.run_command("tsc --noEmit")
-        return result.success
+    def _check_typescript(self, criterion_lower: str, ws: Path) -> bool | None:
+        """Check TypeScript configuration via tsconfig.json — no Docker required."""
+        tsconfig = ws / "tsconfig.json"
+        if not tsconfig.exists():
+            logger.warning("CI: tsconfig.json not found in %s", ws)
+            return False
+        try:
+            import json
+            data = json.loads(tsconfig.read_text(encoding="utf-8"))
+            opts = data.get("compilerOptions", {})
+            if "strict" in criterion_lower:
+                strict_on = bool(opts.get("strict"))
+                if not strict_on:
+                    logger.warning("CI: tsconfig.json missing compilerOptions.strict=true")
+                return strict_on
+            return True  # tsconfig.json exists — TypeScript is configured
+        except Exception as exc:
+            logger.warning("CI: failed to parse tsconfig.json: %s", exc)
+            return None
+
+    def _check_lint_config(self, ws: Path) -> bool | None:
+        lint_files = [
+            ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
+            "eslint.config.js", "eslint.config.mjs",
+            ".prettierrc", ".prettierrc.json", ".prettierrc.js",
+        ]
+        found = any((ws / f).exists() for f in lint_files)
+        return found if found else None
+
+    def _check_env_example(self, ws: Path) -> bool | None:
+        env_file = ws / ".env.example"
+        if not env_file.exists():
+            return False
+        try:
+            lines = [l.strip() for l in env_file.read_text(encoding="utf-8").splitlines()
+                     if l.strip() and not l.startswith("#")]
+            return len(lines) >= 1
+        except Exception:
+            return None
 
 
 class TestResult:

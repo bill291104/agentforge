@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any, Optional
 
 from langgraph.graph.message import add_messages
@@ -13,11 +14,17 @@ from agentforge.core.models import (
     WorkflowSpec,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def make_initial_state(session_id: str, user_request: str) -> "AgentForgeState":
     from agentforge.workspace.manager import WorkspaceManager
     ws = WorkspaceManager(session_id)
     ws.init()
+    logger.info(
+        "[workspace] initialized session=%s root=%s exists=%s",
+        session_id[:8], ws.root, ws.root.exists(),
+    )
     return AgentForgeState(
         session_id=session_id,
         user_request=user_request,
