@@ -182,7 +182,7 @@ class SlackInterface(BaseInterface):
                         self.stream_graph_to_slack(graph, None, channel, thread_ts, session_id)
                     )
 
-            elif stage == "l4_waiting" and session_id:
+            elif stage in ("l4_waiting", "l2_waiting", "plan_waiting", "plan_modify_waiting") and session_id:
                 task_id = state.get("task_id", "?")
                 self._pending_l4[session_id] = {
                     "channel": channel,
@@ -191,10 +191,17 @@ class SlackInterface(BaseInterface):
                     "config": {"configurable": {"thread_id": session_id}},
                     "task_id": task_id,
                 }
-                logger.info("Restored L4 state for session %s", session_id[:8])
+                logger.info("Restored interrupt state stage=%s session=%s", stage, session_id[:8])
+                if stage == "l4_waiting":
+                    note = "L4 에스컬레이션 버튼을 누르거나 메시지로 계속/중단을 알려주세요."
+                elif stage == "l2_waiting":
+                    note = "L2 모델 업그레이드 버튼을 누르거나 메시지로 의사를 알려주세요."
+                elif stage == "plan_waiting":
+                    note = "작업 계획서 승인 버튼을 누르거나 메시지로 의사를 알려주세요."
+                else:
+                    note = "수정 내용을 이 스레드에 답장해 주세요."
                 await self._notify(channel, thread_ts,
-                                   f"봇이 재시작됐습니다. "
-                                   f"세션 `{session_id[:8]}`의 L4 에스컬레이션 버튼을 눌러 계속하세요.")
+                                   f"봇이 재시작됐습니다. 세션 `{session_id[:8]}`이 대기 중입니다. {note}")
 
     async def stop(self) -> None:
         if _MOCK or self._handler is None:
@@ -1390,27 +1397,53 @@ class SlackInterface(BaseInterface):
         channel: str,
         thread_ts: str,
     ) -> None:
-        """Delegate to LeaderAgent tool calling (allow_actions=False — read-only)."""
+        """Delegate to LeaderAgent tool calling.
+
+        Read-only by default, but if the user explicitly requests a resume/restart
+        (e.g. after an auto-resume failure), allow action tools so they can trigger it.
+        """
         from agentforge.agents.leader import LeaderAgent
 
+        session_id = state.get("session_id", "")
         logger.info(
             "[dispatch_running] thread=%s session=%s user_text=%.80s",
-            thread_ts[:12],
-            str(state.get("session_id", ""))[:8] or "none",
-            user_message,
+            thread_ts[:12], session_id[:8] or "none", user_message,
         )
         global_ctx = await self._load_global_context_str()
-        enriched_state = {**state, "_global_context": global_ctx}
+        thread_text = await self._fetch_thread_messages(client, channel, thread_ts)
+        enriched_state = {**state, "_global_context": global_ctx, "thread_messages": thread_text}
 
         async def post(text: str) -> None:
             await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+        async def on_resume(sid: str = "") -> None:
+            await self._resume_from_checkpoint(client, state, channel, thread_ts,
+                                               override_session_id=sid)
+
+        async def on_retry(requirements: str = "") -> None:
+            confirmed = requirements.strip() or state.get("summary", "")
+            if not confirmed:
+                state["stage"] = "clarifying"
+                await self._persist(thread_ts)
+                await self._run_clarification_turn(client, channel, thread_ts)
+                return
+            state["summary"] = confirmed
+            state["result"] = None
+            await self._execute_graph(client, state)
+
+        # Allow actions only when the user is explicitly asking to resume/restart.
+        # This handles the case where auto-resume failed and the session is stuck "running".
+        _resume_keywords = {"재개", "이어서", "계속", "재시작", "다시", "resume", "retry"}
+        allow_actions = any(kw in user_message for kw in _resume_keywords)
 
         agent = LeaderAgent()
         await agent.dispatch_user_message(
             user_message=user_message,
             thread_state=enriched_state,
-            allow_actions=False,
+            allow_actions=allow_actions,
             post_fn=post,
+            on_resume_session=on_resume if allow_actions else None,
+            on_retry_session=on_retry if allow_actions else None,
             on_start_new_task=None,
             on_delete_thread=None,
         )
