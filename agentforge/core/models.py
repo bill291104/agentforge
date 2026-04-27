@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal, Optional
@@ -18,6 +19,7 @@ MODEL_IDS: dict[ModelTier, str] = {
     ModelTier.OPUS: "claude-opus-4-7",
     ModelTier.SONNET: "claude-sonnet-4-6",
     ModelTier.HAIKU: "claude-haiku-4-5-20251001",
+    ModelTier.LOCAL: os.getenv("AF_LOCAL_MODEL", "ollama/llama3"),
 }
 
 
@@ -89,8 +91,7 @@ class TaskInstruction(BaseModel):
 class TaskReport(BaseModel):
     task_id: str
     status: TaskStatus
-    files: list[dict[str, str]] = []       # [{"path": "...", "content": "..."}]
-    deliverables: list[str] = []            # relative paths of written files
+    deliverables: list[str] = []            # relative paths of written/committed files
     evidence: dict[str, Any] = {}
     summary: str
     tokens_used: int = 0

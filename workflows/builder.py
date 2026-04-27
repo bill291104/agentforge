@@ -81,6 +81,8 @@ class GraphBuilder:
         )
         from agentforge.graph.edges import (
             route_after_escalate,
+            route_after_finalize,
+            route_after_interrupt_l4,
             route_after_merge_task,
             route_after_present_plan,
             route_after_verify_ci,
@@ -111,8 +113,14 @@ class GraphBuilder:
         graph.add_edge("spawn_sub_orchestrator", "dispatch_workers")
         graph.add_edge("dispatch_workers", "verify_ci")
         graph.add_edge("interrupt_l2", "dispatch_workers")
-        graph.add_edge("interrupt_l4", END)
-        graph.add_edge("finalize", END)
+
+        # finalize: if tests passed → END; if tests failed → check_context for re-dispatch
+        graph.add_conditional_edges("finalize", route_after_finalize,
+                                    {"check_context": "check_context", END: END})
+
+        # interrupt_l4: "continue" → check_context (re-dispatch); "stop" → finalize
+        graph.add_conditional_edges("interrupt_l4", route_after_interrupt_l4,
+                                    {"check_context": "check_context", "finalize": "finalize"})
 
         # Conditional edges
         graph.add_conditional_edges("present_plan", route_after_present_plan)

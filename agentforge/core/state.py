@@ -44,6 +44,7 @@ def make_initial_state(session_id: str, user_request: str) -> "AgentForgeState":
         current_task_id=None,
         delegated_task_ids=[],
         final_report=None,
+        test_passed=True,
         messages=[],
     )
 
@@ -82,6 +83,7 @@ class AgentForgeState(TypedDict):
 
     # Final output
     final_report: Optional[str]
+    test_passed: bool                       # Stage 4 통합 테스트 결과 (기본 True)
 
     # LangGraph messages (for agent turns)
     messages: Annotated[list, add_messages]

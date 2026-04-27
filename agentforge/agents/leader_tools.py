@@ -8,7 +8,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 import anthropic
 
-from agentforge.core.models import MODEL_IDS, ModelTier
+from agentforge.core.models import MODEL_IDS, ModelTier, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -652,8 +652,10 @@ class LeaderToolExecutor:
             rows.append(f"- [{status}] {tid}: {title} (시도:{attempts}) {summary[:80]}")
 
         total     = len(dag_index)
-        completed = sum(1 for s in dag_index.values() if str(s) in ("completed", "TaskStatus.COMPLETED"))
-        failed    = sum(1 for s in dag_index.values() if str(s) in ("failed",    "TaskStatus.FAILED"))
+        completed = sum(1 for s in dag_index.values()
+                        if s == TaskStatus.COMPLETED or str(s) == "completed")
+        failed    = sum(1 for s in dag_index.values()
+                        if s == TaskStatus.FAILED or str(s) == "failed")
 
         return (
             f"세션 {session_id[:8]} 진행 상태 — 완료: {completed}/{total}  실패: {failed}\n"

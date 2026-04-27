@@ -236,7 +236,10 @@ class WorkerAgent(BaseAgent):
                 if block.name == "write_file" and result.startswith("✅"):
                     written_files.append(block.input["path"])
                 if block.name == "git_commit" and "sha=" in result:
-                    last_commit_sha = result.split("sha=")[1].strip()
+                    try:
+                        last_commit_sha = result.split("sha=")[1].strip()
+                    except (IndexError, AttributeError):
+                        pass
                     # Supplement written_files with files actually committed in this sha
                     if last_commit_sha and last_commit_sha != "(no changes)" and ws_root:
                         try:

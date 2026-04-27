@@ -63,6 +63,8 @@ class SlackInterface(BaseInterface):
         self._pending_clarification: dict[str, dict] = {}
         # session_id → pending L4 info (also persisted via thread_contexts stage=l4_waiting)
         self._pending_l4: dict[str, dict] = {}
+        # session_id → Slack message ts for the live status message (updated in-place)
+        self._status_ts: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # BaseInterface
@@ -688,16 +690,16 @@ class SlackInterface(BaseInterface):
         - Pass initial_state=None to resume from existing checkpoint.
         - Pass Command(resume=value) to resume from an interrupt node.
         """
-        config     = {"configurable": {"thread_id": session_id}}
-        status_ts: Optional[str] = None
+        config = {"configurable": {"thread_id": session_id}}
 
         async def _post_or_update(text: str) -> None:
-            nonlocal status_ts
-            if status_ts is None:
+            ts = self._status_ts.get(session_id)
+            if ts is None:
                 resp = await self.send_message(channel, text, thread_ts=thread_ts)
-                status_ts = resp.get("ts")
+                if resp:
+                    self._status_ts[session_id] = resp.get("ts", "")
             else:
-                await self.update_message(channel, status_ts, text)
+                await self.update_message(channel, ts, text)
 
         from agentforge.observer.historian import Historian
         historian = Historian()
@@ -819,7 +821,11 @@ class SlackInterface(BaseInterface):
                 elif event_name == "on_chain_end" and node_name == "finalize":
                     output = event.get("data", {}).get("output", {})
                     final_report = output.get("final_report", "완료")
-                    await _post_or_update(f"완료\n\n{final_report}")
+                    # Update the live status message to show completion, then post the full
+                    # report as a separate new message so it's easy to find in the thread.
+                    await _post_or_update("✅ 모든 작업 완료 — 최종 보고서를 아래에서 확인하세요.")
+                    self._status_ts.pop(session_id, None)  # next call posts fresh message
+                    await self.send_message(channel, final_report, thread_ts=thread_ts)
                     asyncio.create_task(historian.record_event(
                         session_id=session_id,
                         node="finalize",
@@ -930,6 +936,7 @@ class SlackInterface(BaseInterface):
             _interrupt_stages = {"l2_waiting", "l4_waiting", "plan_waiting", "plan_modify_waiting"}
             if state.get("stage") not in _interrupt_stages:
                 state["stage"] = "completed"
+                self._status_ts.pop(session_id, None)  # clear live-status slot on completion
             state["result"] = final_report or (f"오류: {error_msg}" if error_msg else "")
             # "summary" retains the clarified requirements — do not overwrite
             self._pending_clarification[thread_ts] = state

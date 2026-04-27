@@ -436,8 +436,9 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
         dag_index[task_id] = TaskStatus.PENDING
         logger.info("[escalate] L1→L2: spawn new agent task=%s failure_ctx=%.80s", task_id, failure_ctx)
     elif level == EscalationLevel.L2:
-        # Upgrade model tier
-        upgraded_tier = _upgrade_tier(node.instruction.model_tier)
+        # Upgrade model tier — capture old tier before reassigning node
+        old_tier = node.instruction.model_tier
+        upgraded_tier = _upgrade_tier(old_tier)
         new_instruction = node.instruction.model_copy(update={"model_tier": upgraded_tier})
         node = node.model_copy(update={
             "escalation_level": EscalationLevel.L3,
@@ -449,7 +450,7 @@ async def escalate_node(state: AgentForgeState) -> dict[str, Any]:
         dag_index[task_id] = TaskStatus.PENDING  # reset so dispatch_workers picks it up
         logger.info(
             "[escalate] L2→L3: upgrade tier %s→%s task=%s",
-            node.instruction.model_tier, upgraded_tier, task_id,
+            old_tier, upgraded_tier, task_id,
         )
     elif level == EscalationLevel.L3:
         # Stop task, block dependents, continue rest
@@ -497,8 +498,8 @@ async def interrupt_l2_node(state: AgentForgeState) -> dict[str, Any]:
     user_choice = interrupt({
         "type": "l2_approval",
         "task_id": task_id,
-        "current_tier": str(current_tier),
-        "next_tier": str(next_tier),
+        "current_tier": current_tier.value,
+        "next_tier": next_tier.value,
     })
 
     if user_choice.get("choice") == "upgrade":
@@ -547,12 +548,34 @@ async def interrupt_l4_node(state: AgentForgeState) -> dict[str, Any]:
     )
 
     # Pause here and wait for user choice via Command(resume="continue"|"stop")
-    interrupt({
+    user_choice = interrupt({
         "type": "l4_approval",
         "task_id": task_id,
         "report": report,
     })
 
+    # "continue": reset the task to PENDING so dispatch_workers picks it up again
+    if isinstance(user_choice, str) and user_choice == "continue":
+        task_nodes = dict(state.get("task_nodes", {}))
+        dag_index  = dict(state.get("dag_index", {}))
+        node = task_nodes.get(task_id)
+        if node:
+            task_nodes[task_id] = node.model_copy(update={
+                "status": TaskStatus.PENDING,
+                "escalation_level": EscalationLevel.L0,
+                "attempt_count": 0,
+                "report": None,
+            })
+            dag_index[task_id] = TaskStatus.PENDING
+        logger.info("[interrupt_l4] user chose continue — resetting task=%s to PENDING", task_id)
+        return {
+            "task_nodes": task_nodes,
+            "dag_index": dag_index,
+            "current_escalation_level": int(EscalationLevel.L0),
+        }
+
+    # "stop" or any other value: mark task FAILED and return final report
+    logger.info("[interrupt_l4] user chose stop — ending workflow for task=%s", task_id)
     return {"final_report": report}
 
 
@@ -688,12 +711,34 @@ async def finalize_node(state: AgentForgeState) -> dict[str, Any]:
 
     run_guide = _detect_run_guide(ws)
 
+    # Run integration tests before finalizing (Stage 4 requirement)
+    test_passed = True
+    test_section = ""
+    if ws:
+        try:
+            test_result = await ws.run_tests()
+            test_passed = test_result.success or test_result.skipped
+            if not test_result.skipped:
+                status_icon = "✅ 통과" if test_result.success else "❌ 실패"
+                test_section = (
+                    f"### 통합 테스트 결과\n{status_icon} (runner: {test_result.runner})\n"
+                    f"```\n{test_result.output[:500]}\n```"
+                )
+                logger.info("[finalize] tests runner=%s success=%s", test_result.runner, test_result.success)
+            else:
+                test_section = "### 통합 테스트 결과\n(테스트 파일 없음 — 건너뜀)"
+        except Exception as exc:
+            logger.warning("[finalize] test run failed: %s", exc)
+            test_section = f"### 통합 테스트 결과\n⚠️ 실행 오류: {exc}"
+
     report = "\n".join(filter(None, [
         "## 🎉 작업 완료 보고서",
         f"완료: {completed}/{total} | 실패: {failed} | 재시도: {retries}회 | 토큰: {tokens:,} | 소요: {duration:.0f}초",
         "",
         "### 산출물" if summaries else "",
         *[f"- {s}" for s in summaries],
+        "",
+        test_section,
         "",
         "### 실행 방법",
         run_guide,
@@ -709,19 +754,22 @@ async def finalize_node(state: AgentForgeState) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("[finalize] FINAL_REPORT.md write failed: %s", exc)
 
-    return {"final_report": report}
+    return {"final_report": report, "test_passed": test_passed}
 
 
 def _detect_run_guide(ws) -> str:
     """Detect how to run the project from file existence — no LLM needed."""
     if ws is None:
         return "(워크스페이스 없음)"
+    root = ws.root
     checks = [
-        (ws.root / "package.json",       "```\nnpm install && npm run dev\n```\n→ http://localhost:3000"),
-        (ws.root / "requirements.txt",   "```\npip install -r requirements.txt\npython main.py\n```"),
-        (ws.root / "pyproject.toml",     "```\nuv run python main.py\n```"),
-        (ws.root / "Makefile",           "```\nmake run\n```"),
-        (ws.root / "docker-compose.yml", "```\ndocker compose up\n```"),
+        (root / "docker-compose.yml",             "```\ndocker compose up\n```"),
+        (root / "Makefile",                       "```\nmake run\n```"),
+        (root / "package.json",                   "```\nnpm install && npm run dev\n```\n→ http://localhost:3000"),
+        (root / "frontend" / "package.json",      "```\ncd frontend && npm install && npm run dev\n```\n→ http://localhost:3000"),
+        (root / "pyproject.toml",                 "```\nuv run python main.py\n```"),
+        (root / "requirements.txt",               "```\npip install -r requirements.txt && python main.py\n```"),
+        (root / "backend" / "requirements.txt",   "```\ncd backend && pip install -r requirements.txt && python main.py\n```"),
     ]
     for path, guide in checks:
         if path.exists():
@@ -742,10 +790,14 @@ def _get_ready_task_ids(
     for tid, node in task_nodes.items():
         if dag_index.get(tid) != TaskStatus.PENDING:
             continue
-        deps_done = all(
-            dag_index.get(dep) == TaskStatus.COMPLETED
-            for dep in node.instruction.depends_on
-        )
+        deps_done = True
+        for dep in node.instruction.depends_on:
+            if dep not in dag_index:
+                logger.warning("[dag] task=%s depends on unknown task=%s — skipping dep", tid, dep)
+                continue
+            if dag_index[dep] != TaskStatus.COMPLETED:
+                deps_done = False
+                break
         if deps_done:
             ready.append(tid)
     return sorted(ready, key=lambda tid: task_nodes[tid].instruction.priority)

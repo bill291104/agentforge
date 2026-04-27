@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from langgraph.graph import END
+
 from agentforge.core.models import EscalationLevel, TaskStatus
 from agentforge.core.state import AgentForgeState
 
@@ -65,6 +67,24 @@ def route_after_present_plan(state: AgentForgeState) -> str:
         logger.info("[route] present_plan → refine_requirements (user requested modification)")
         return "refine_requirements"
     logger.info("[route] present_plan → check_context (plan approved)")
+    return "check_context"
+
+
+def route_after_finalize(state: AgentForgeState) -> str:
+    """After finalize: if integration tests failed, re-dispatch workers; else END."""
+    if not state.get("test_passed", True):
+        logger.info("[route] finalize → check_context (integration tests failed)")
+        return "check_context"
+    logger.info("[route] finalize → END")
+    return END
+
+
+def route_after_interrupt_l4(state: AgentForgeState) -> str:
+    """After L4 interrupt: 'continue' resets task → check_context; 'stop' → finalize."""
+    if state.get("final_report"):
+        logger.info("[route] interrupt_l4 → finalize (user stopped workflow)")
+        return "finalize"
+    logger.info("[route] interrupt_l4 → check_context (user chose continue)")
     return "check_context"
 
 

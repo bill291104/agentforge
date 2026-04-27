@@ -5,9 +5,14 @@ from pathlib import Path
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 _DB_PATH = str(Path(os.getenv("AF_DB_PATH", "agentforge.db")))
 _saver: AsyncSqliteSaver | None = None
+
+# Register AF types so LangGraph can deserialize them from checkpoint without warnings.
+# "True" allows all modules — narrow this to specific modules if security is a concern.
+_serde = JsonPlusSerializer(allowed_msgpack_modules=True)
 
 
 async def init_checkpointer() -> AsyncSqliteSaver:
@@ -16,7 +21,7 @@ async def init_checkpointer() -> AsyncSqliteSaver:
     global _saver
     if _saver is None:
         conn = await aiosqlite.connect(_DB_PATH)
-        _saver = AsyncSqliteSaver(conn)
+        _saver = AsyncSqliteSaver(conn, serde=_serde)
         await _saver.setup()
     return _saver
 

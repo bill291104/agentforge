@@ -122,7 +122,7 @@ def _parse_response(raw: str, instruction: TaskInstruction) -> SemanticResult:
     except Exception as exc:
         # Parsing failed → conservative REJECT (not ACCEPT)
         # An unparseable response means we cannot confirm acceptance.
-        logger.warning("Semantic parse failed (%s) — defaulting to REJECT. raw=%.200s", exc, raw)
+        logger.warning("Semantic parse failed (%s) — defaulting to REJECT. raw=%.2000s", exc, raw)
         return SemanticResult(
             verdict="REJECT",
             criteria_results={c: "FAIL" for c in instruction.acceptance_criteria},
