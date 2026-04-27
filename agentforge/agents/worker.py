@@ -57,6 +57,15 @@ _WORKER_TOOLS = [
         },
     },
     {
+        "name": "git_status",
+        "description": (
+            "현재 브랜치의 변경 상태를 보여줍니다. "
+            "이미 커밋된 파일, 미커밋 변경사항, main과의 차이를 파악할 때 사용하세요. "
+            "파일이 이미 존재하더라도 이 브랜치에서 구현해야 할 내용이 있는지 확인하세요."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "git_commit",
         "description": "모든 변경사항을 스테이징하고 커밋합니다. check_criterion으로 모든 수락 기준 확인 후 호출하세요.",
         "input_schema": {
@@ -107,15 +116,17 @@ _WORKER_SYSTEM_PROMPT = """\
 
 작업 순서:
 1. read_file로 지시 파일을 읽고 요구사항과 수락 기준을 파악하세요
-2. write_file로 필요한 파일들을 하나씩 작성하세요
-3. 커밋 전에 각 수락 기준을 check_criterion으로 반드시 확인하세요
-4. 모든 기준이 ✅ 확인된 후 git_commit을 호출하세요
-5. check_criterion이 ❌를 반환하면 해당 부분을 수정하고 다시 확인하세요
+2. git_status로 현재 브랜치 상태를 확인하세요
+   - "이 브랜치에서 변경된 파일 없음" → 이 태스크에서 파일을 구현해야 합니다
+   - 파일이 이미 존재하더라도 스텁(placeholder)일 수 있습니다 — 내용을 확인하세요
+3. write_file로 필요한 파일들을 구현하세요 (기존 파일도 완전한 구현으로 덮어씁니다)
+4. 커밋 전에 각 수락 기준을 check_criterion으로 반드시 확인하세요
+5. 모든 기준이 ✅ 확인된 후 git_commit을 호출하세요
 
 규칙:
 - git_commit 없이 종료하면 작업 실패로 처리됩니다
-- 파일은 한 번에 하나씩 write_file로 작성하세요
-- 핵심 기능을 먼저 구현하고 git_commit을 호출하세요. 추가 파일은 그 다음에 작성하세요.
+- 파일이 이미 있어도 "이미 완료"로 판단하지 마세요 — 반드시 내용을 read_file로 검증하세요
+- 내용이 불완전하거나 placeholder면 write_file로 완전한 구현을 작성하세요
 - 커밋 메시지 형식: feat({task_id}): 간략한 설명
 - 기존 파일 구조나 import 경로를 파악할 때 search_files를 활용하세요
 """
@@ -226,6 +237,15 @@ class WorkerAgent(BaseAgent):
                     written_files.append(block.input["path"])
                 if block.name == "git_commit" and "sha=" in result:
                     last_commit_sha = result.split("sha=")[1].strip()
+                    # Supplement written_files with files actually committed in this sha
+                    if last_commit_sha and last_commit_sha != "(no changes)" and ws_root:
+                        try:
+                            committed = _make_ws(ws_root).get_commit_files(last_commit_sha)
+                            for f in committed:
+                                if f and f not in written_files and not f.startswith("instructions/"):
+                                    written_files.append(f)
+                        except Exception:
+                            pass
                     logger.info(
                         "[worker:%s] commit turn=%d sha=%s total_files=%d",
                         instruction.task_id, turn, last_commit_sha, len(written_files),
@@ -347,6 +367,17 @@ def _execute_worker_tool(name: str, args: dict, ws_root: Path | None) -> str:
         if name == "git_commit":
             sha = ws.commit(args["message"])
             return f"커밋 완료 sha={sha}"
+        if name == "git_status":
+            status = ws.git_status_short()
+            current = ws._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            # Show files committed in this branch vs main
+            branch_files = ws.get_branch_diff_files(current, "main") if current != "main" else []
+            lines = [f"브랜치: {current}", f"미커밋 변경:\n{status}"]
+            if branch_files:
+                lines.append("이 브랜치에서 변경된 파일 (vs main):\n" + "\n".join(f"  {f}" for f in branch_files))
+            else:
+                lines.append("이 브랜치에서 main 대비 변경된 파일 없음 — 구현이 필요합니다!")
+            return "\n".join(lines)
     except Exception as exc:
         return f"오류: {exc}"
     return f"알 수 없는 도구: {name}"

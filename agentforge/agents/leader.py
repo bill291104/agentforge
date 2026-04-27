@@ -214,9 +214,21 @@ class LeaderAgent(BaseAgent):
         on_resume_session=None,
         on_continue_clarification=None,
         on_delete_thread=None,
+        # Interrupt-specific callbacks
+        on_l4_continue=None,
+        on_l4_abort=None,
+        on_l2_upgrade=None,
+        on_l2_stop=None,
+        on_plan_approve=None,
+        on_plan_modify=None,
+        interrupt_context: str = "",
     ) -> None:
         """Route a user message through multi-turn tool calling."""
-        from agentforge.agents.leader_tools import LeaderToolExecutor
+        from agentforge.agents.leader_tools import LeaderToolExecutor, INTERRUPT_TOOLS
+        has_interrupt = any([
+            on_l4_continue, on_l4_abort, on_l2_upgrade, on_l2_stop,
+            on_plan_approve, on_plan_modify,
+        ])
         executor = LeaderToolExecutor(
             thread_state=thread_state,
             on_start_new_task=on_start_new_task,
@@ -224,8 +236,20 @@ class LeaderAgent(BaseAgent):
             on_resume_session=on_resume_session,
             on_continue_clarification=on_continue_clarification,
             on_delete_thread=on_delete_thread,
+            on_l4_continue=on_l4_continue,
+            on_l4_abort=on_l4_abort,
+            on_l2_upgrade=on_l2_upgrade,
+            on_l2_stop=on_l2_stop,
+            on_plan_approve=on_plan_approve,
+            on_plan_modify=on_plan_modify,
         )
-        await executor.dispatch(user_message, allow_actions=allow_actions, post_fn=post_fn)
+        await executor.dispatch(
+            user_message,
+            allow_actions=allow_actions,
+            post_fn=post_fn,
+            extra_tools=INTERRUPT_TOOLS if has_interrupt else None,
+            interrupt_context=interrupt_context,
+        )
 
 
 def _is_mock() -> bool:

@@ -118,6 +118,66 @@ QUERY_TOOLS: list[dict] = [
     },
 ]
 
+INTERRUPT_TOOLS: list[dict] = [
+    {
+        "name": "continue_task",
+        "description": (
+            "에스컬레이션된 태스크를 계속 진행합니다. "
+            "조건이나 수정 사항이 있으면 conditions에 명시하세요 "
+            "(예: 'TypeScript strict 제외', '기존 파일 검증만 하면 됨'). "
+            "L4 에스컬레이션 대기 상황에서 사용합니다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "conditions": {
+                    "type": "string",
+                    "description": "계속 진행 시 적용할 조건 또는 수정 사항. 조건이 없으면 생략하세요.",
+                }
+            },
+        },
+    },
+    {
+        "name": "abort_task",
+        "description": "에스컬레이션된 태스크를 중단합니다. L4 에스컬레이션 대기 상황에서 사용합니다.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "중단 이유 (로그용)"},
+            },
+        },
+    },
+    {
+        "name": "upgrade_model",
+        "description": "태스크를 더 높은 등급의 모델로 업그레이드하여 재시도합니다. L2 에스컬레이션 대기 상황에서 사용합니다.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "stop_task",
+        "description": "태스크를 중단합니다. L2 에스컬레이션 대기 상황에서 사용합니다.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "approve_plan",
+        "description": "제시된 작업 계획서를 승인하고 작업을 시작합니다. plan_waiting 상황에서 사용합니다.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "request_plan_modification",
+        "description": "작업 계획서 수정을 요청합니다. plan_waiting 상황에서 사용합니다.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "feedback": {
+                    "type": "string",
+                    "description": "수정 요청 내용 (예: 'FastAPI 대신 Flask 사용', '태스크 3과 4를 합쳐서')",
+                }
+            },
+            "required": ["feedback"],
+        },
+    },
+]
+
 ACTION_TOOLS: list[dict] = [
     {
         "name": "resume_session",
@@ -290,6 +350,13 @@ class LeaderToolExecutor:
         on_resume_session: Optional[Callable[[str], Coroutine]] = None,
         on_continue_clarification: Optional[Callable[[str], Coroutine]] = None,
         on_delete_thread: Optional[Callable[[], Coroutine]] = None,
+        # Interrupt-specific callbacks
+        on_l4_continue: Optional[Callable[[str], Coroutine]] = None,
+        on_l4_abort: Optional[Callable[[], Coroutine]] = None,
+        on_l2_upgrade: Optional[Callable[[], Coroutine]] = None,
+        on_l2_stop: Optional[Callable[[], Coroutine]] = None,
+        on_plan_approve: Optional[Callable[[], Coroutine]] = None,
+        on_plan_modify: Optional[Callable[[str], Coroutine]] = None,
     ) -> None:
         self._state = thread_state
         self._on_start_new_task = on_start_new_task
@@ -297,15 +364,25 @@ class LeaderToolExecutor:
         self._on_resume_session = on_resume_session
         self._on_continue_clarification = on_continue_clarification
         self._on_delete_thread = on_delete_thread
+        self._on_l4_continue = on_l4_continue
+        self._on_l4_abort = on_l4_abort
+        self._on_l2_upgrade = on_l2_upgrade
+        self._on_l2_stop = on_l2_stop
+        self._on_plan_approve = on_plan_approve
+        self._on_plan_modify = on_plan_modify
 
     async def dispatch(
         self,
         user_message: str,
         allow_actions: bool,
         post_fn: PostFn,
+        extra_tools: Optional[list[dict]] = None,
+        interrupt_context: str = "",
     ) -> None:
         tools = LEADER_TOOLS if allow_actions else QUERY_TOOLS
-        context = self._build_context()
+        if extra_tools:
+            tools = list(tools) + extra_tools
+        context = self._build_context(interrupt_context=interrupt_context)
         messages: list[dict] = [
             {"role": "user", "content": f"{context}\n\n사용자: {user_message}"}
         ]
@@ -397,6 +474,46 @@ class LeaderToolExecutor:
                     await post_fn(answer)
                     return
 
+                # Interrupt action tools
+                if name == "continue_task":
+                    conditions = args.get("conditions", "").strip()
+                    logger.info("[leader_tools] → continue_task conditions=%.120s", conditions)
+                    if self._on_l4_continue:
+                        await self._on_l4_continue(conditions)
+                    return
+
+                if name == "abort_task":
+                    reason = args.get("reason", "")
+                    logger.info("[leader_tools] → abort_task reason=%.120s", reason)
+                    if self._on_l4_abort:
+                        await self._on_l4_abort()
+                    return
+
+                if name == "upgrade_model":
+                    logger.info("[leader_tools] → upgrade_model")
+                    if self._on_l2_upgrade:
+                        await self._on_l2_upgrade()
+                    return
+
+                if name == "stop_task":
+                    logger.info("[leader_tools] → stop_task")
+                    if self._on_l2_stop:
+                        await self._on_l2_stop()
+                    return
+
+                if name == "approve_plan":
+                    logger.info("[leader_tools] → approve_plan")
+                    if self._on_plan_approve:
+                        await self._on_plan_approve()
+                    return
+
+                if name == "request_plan_modification":
+                    feedback = args.get("feedback", "").strip()
+                    logger.info("[leader_tools] → request_plan_modification feedback=%.120s", feedback)
+                    if feedback and self._on_plan_modify:
+                        await self._on_plan_modify(feedback)
+                    return
+
                 if name == "update_global_context":
                     key   = args.get("key", "")
                     value = args.get("value")
@@ -434,7 +551,7 @@ class LeaderToolExecutor:
         text = " ".join(getattr(b, "text", "") for b in text_blocks).strip()
         await post_fn(text or "처리 제한에 도달했습니다. 다시 시도해 주세요.")
 
-    def _build_context(self) -> str:
+    def _build_context(self, interrupt_context: str = "") -> str:
         original_request  = self._state.get("request", "")
         clarified_summary = self._state.get("summary", "")
         result            = self._state.get("result", "")
@@ -453,6 +570,8 @@ class LeaderToolExecutor:
         )
 
         parts = ["## 현재 스레드 상태", f"- 단계: {stage}"]
+        if interrupt_context:
+            parts.append(f"\n## ⚠️ 현재 대기 중인 상황\n{interrupt_context}")
         if session_id:
             parts.append(f"- 세션 ID: {session_id}")
         if original_request:

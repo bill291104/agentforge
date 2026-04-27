@@ -153,6 +153,30 @@ class WorkspaceManager:
             if current and current != into:
                 self._git("checkout", current)
 
+    def get_commit_files(self, sha: str = "HEAD") -> list[str]:
+        """Return list of files changed in a specific commit."""
+        result = subprocess.run(
+            ["git", "show", "--name-only", "--format=", sha],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        return [f for f in result.stdout.strip().splitlines() if f.strip()]
+
+    def get_branch_diff_files(self, branch: str, base: str = "main") -> list[str]:
+        """Return files changed in branch vs base (entire branch, not just last commit)."""
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{base}...{branch}"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        return [f for f in result.stdout.strip().splitlines() if f.strip()]
+
+    def git_status_short(self) -> str:
+        """Return short git status output (porcelain)."""
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        return result.stdout.strip() or "(변경 없음)"
+
     def diff_files(self, base: str = "HEAD~1") -> list[str]:
         """Return list of file paths changed since base commit."""
         result = subprocess.run(

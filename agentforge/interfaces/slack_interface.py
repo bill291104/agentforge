@@ -382,44 +382,49 @@ class SlackInterface(BaseInterface):
                     task.add_done_callback(self._on_task_done)
                 return
             if stage == "l2_waiting":
-                await say(
-                    text="위 버튼으로 업그레이드 승인 또는 작업 중단을 선택해 주세요.",
-                    thread_ts=thread_ts,
-                )
+                if request:
+                    task = asyncio.create_task(
+                        self._dispatch_interrupt_thread(
+                            self._app.client, existing, request, channel, thread_ts,
+                            interrupt_type="l2",
+                        )
+                    )
+                    task.add_done_callback(self._on_task_done)
+                else:
+                    await say(
+                        text="버튼으로 업그레이드 승인/중단을 선택하거나, 메시지로 의사를 알려주세요.",
+                        thread_ts=thread_ts,
+                    )
                 return
             if stage == "l4_waiting":
-                lowered = request.lower()
-                session_id_l4 = existing.get("session_id", "")
-                if session_id_l4 and any(k in lowered for k in _CONFIRM_KEYWORDS | {"계속", "continue", "진행"}):
-                    pending_l4 = self._pending_l4.get(session_id_l4)
-                    if pending_l4:
-                        await say(text="계속 진행합니다.", thread_ts=thread_ts)
-                        asyncio.create_task(self._resume_graph(
-                            pending_l4["graph"], pending_l4["config"],
-                            "continue", channel, thread_ts, session_id_l4,
-                        ))
-                        self._pending_l4.pop(session_id_l4, None)
-                        return
-                elif session_id_l4 and any(k in lowered for k in _CANCEL_KEYWORDS):
-                    pending_l4 = self._pending_l4.get(session_id_l4)
-                    if pending_l4:
-                        await say(text="작업을 중단합니다.", thread_ts=thread_ts)
-                        asyncio.create_task(self._resume_graph(
-                            pending_l4["graph"], pending_l4["config"],
-                            "abort", channel, thread_ts, session_id_l4,
-                        ))
-                        self._pending_l4.pop(session_id_l4, None)
-                        return
-                await say(
-                    text="L4 에스컬레이션 버튼을 사용하여 작업을 계속하거나 중단해 주세요.",
-                    thread_ts=thread_ts,
-                )
+                if request:
+                    task = asyncio.create_task(
+                        self._dispatch_interrupt_thread(
+                            self._app.client, existing, request, channel, thread_ts,
+                            interrupt_type="l4",
+                        )
+                    )
+                    task.add_done_callback(self._on_task_done)
+                else:
+                    await say(
+                        text="L4 에스컬레이션 버튼을 사용하거나 메시지로 계속/중단 의사를 알려주세요.",
+                        thread_ts=thread_ts,
+                    )
                 return
             if stage == "plan_waiting":
-                await say(
-                    text="계획서 버튼으로 승인 또는 수정 요청을 해주세요.",
-                    thread_ts=thread_ts,
-                )
+                if request:
+                    task = asyncio.create_task(
+                        self._dispatch_interrupt_thread(
+                            self._app.client, existing, request, channel, thread_ts,
+                            interrupt_type="plan",
+                        )
+                    )
+                    task.add_done_callback(self._on_task_done)
+                else:
+                    await say(
+                        text="계획서 버튼으로 승인/수정 요청을 하거나, 메시지로 의사를 알려주세요.",
+                        thread_ts=thread_ts,
+                    )
                 return
             if stage == "plan_modify_waiting":
                 session_id_val = existing.get("session_id", "")
@@ -1130,6 +1135,169 @@ class SlackInterface(BaseInterface):
     # ------------------------------------------------------------------
     # Completed / running thread dispatchers (tool calling)
     # ------------------------------------------------------------------
+
+    async def _dispatch_interrupt_thread(
+        self,
+        client: Any,
+        state: dict,
+        user_message: str,
+        channel: str,
+        thread_ts: str,
+        interrupt_type: str,  # "l4", "l2", "plan"
+    ) -> None:
+        """Route @mention in an interrupt-waiting state through LeaderAgent with interrupt tools."""
+        from agentforge.agents.leader import LeaderAgent
+
+        session_id = state.get("session_id", "")
+        task_id    = state.get("task_id", "?")
+        pending    = self._pending_l4.get(session_id) if session_id else None
+
+        logger.info(
+            "[dispatch_interrupt] thread=%s stage=%s type=%s session=%s user_text=%.80s",
+            thread_ts[:12], state.get("stage"), interrupt_type,
+            session_id[:8] if session_id else "none", user_message,
+        )
+
+        # Build context string describing the current interrupt situation
+        if interrupt_type == "l4":
+            interrupt_ctx = (
+                f"현재 태스크 `{task_id}`가 최대 재시도를 초과하여 L4 에스컬레이션 대기 중입니다.\n"
+                "사용 가능한 액션:\n"
+                "- continue_task: 태스크를 계속 진행 (조건 추가 가능)\n"
+                "- abort_task: 태스크 중단\n"
+                "- answer_question / 조회 도구: 상황 파악 후 응답"
+            )
+        elif interrupt_type == "l2":
+            interrupt_ctx = (
+                f"현재 태스크 `{task_id}`가 2회 재시도 후 실패하여 L2 모델 업그레이드 대기 중입니다.\n"
+                "사용 가능한 액션:\n"
+                "- upgrade_model: 더 높은 모델로 업그레이드하여 재시도\n"
+                "- stop_task: 태스크 중단\n"
+                "- answer_question / 조회 도구: 상황 파악 후 응답"
+            )
+        else:  # plan
+            interrupt_ctx = (
+                "현재 작업 계획서 승인 대기 중입니다.\n"
+                "사용 가능한 액션:\n"
+                "- approve_plan: 계획 승인 후 작업 시작\n"
+                "- request_plan_modification: 수정 요청\n"
+                "- answer_question / 조회 도구: 계획 내용 설명"
+            )
+
+        thread_text = await self._fetch_thread_messages(client, channel, thread_ts)
+        global_ctx  = await self._load_global_context_str()
+        enriched_state = {
+            **state,
+            "thread_messages": thread_text,
+            "_global_context": global_ctx,
+        }
+
+        async def post(text: str) -> None:
+            await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+        # L4 callbacks
+        async def on_l4_continue(conditions: str) -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다. 버튼을 눌러주세요.")
+                return
+            label = f"계속 진행합니다" + (f" (조건: {conditions})" if conditions else "")
+            await post(label)
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                "continue", channel, thread_ts, session_id,
+            ))
+
+        async def on_l4_abort() -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다.")
+                return
+            await post("태스크를 중단합니다.")
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                "abort", channel, thread_ts, session_id,
+            ))
+
+        # L2 callbacks
+        async def on_l2_upgrade() -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다.")
+                return
+            await post("✅ 업그레이드 승인 — 더 높은 수준의 에이전트로 재시도합니다")
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                {"choice": "upgrade"}, channel, thread_ts, session_id,
+            ))
+
+        async def on_l2_stop() -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다.")
+                return
+            await post("❌ 작업 중단")
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                {"choice": "stop"}, channel, thread_ts, session_id,
+            ))
+
+        # Plan callbacks
+        async def on_plan_approve() -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다.")
+                return
+            await post("✅ 계획 승인 — 작업을 시작합니다...")
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                "approved", channel, thread_ts, session_id,
+            ))
+
+        async def on_plan_modify(feedback: str) -> None:
+            if not pending:
+                await post("세션 정보를 찾을 수 없습니다.")
+                return
+            await post(f"✏️ 수정 요청 접수: {feedback[:100]}")
+            self._pending_l4.pop(session_id, None)
+            state["stage"] = "running"
+            self._pending_clarification[thread_ts] = state
+            await self._persist(thread_ts)
+            asyncio.create_task(self._resume_graph(
+                pending["graph"], pending["config"],
+                {"action": "modify", "feedback": feedback},
+                channel, thread_ts, session_id,
+            ))
+
+        agent = LeaderAgent()
+        await agent.dispatch_user_message(
+            user_message=user_message,
+            thread_state=enriched_state,
+            allow_actions=True,
+            post_fn=post,
+            on_l4_continue=on_l4_continue if interrupt_type == "l4" else None,
+            on_l4_abort=on_l4_abort if interrupt_type == "l4" else None,
+            on_l2_upgrade=on_l2_upgrade if interrupt_type == "l2" else None,
+            on_l2_stop=on_l2_stop if interrupt_type == "l2" else None,
+            on_plan_approve=on_plan_approve if interrupt_type == "plan" else None,
+            on_plan_modify=on_plan_modify if interrupt_type == "plan" else None,
+            interrupt_context=interrupt_ctx,
+        )
 
     async def _dispatch_completed_thread(
         self,
