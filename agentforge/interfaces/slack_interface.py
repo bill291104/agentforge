@@ -213,10 +213,13 @@ class SlackInterface(BaseInterface):
             return {}
         return await self._app.client.chat_update(channel=channel, ts=ts, text=text, **kwargs)
 
-    async def send_l4_prompt(self, channel: str, thread_ts: str, task_id: str, summary: str) -> Any:
-        blocks = _build_l4_blocks(task_id, summary)
+    async def send_l4_prompt(
+        self, channel: str, thread_ts: str, task_id: str, summary: str,
+        session_id: str = "",
+    ) -> Any:
+        blocks = _build_l4_blocks(session_id, task_id, summary)
         if _MOCK:
-            logger.info("[mock] send_l4_prompt task_id=%s", task_id)
+            logger.info("[mock] send_l4_prompt task_id=%s session_id=%s", task_id, session_id[:8])
             return {"ts": "0.0"}
         return await self._app.client.chat_postMessage(
             channel=channel,
@@ -385,6 +388,28 @@ class SlackInterface(BaseInterface):
                 )
                 return
             if stage == "l4_waiting":
+                lowered = request.lower()
+                session_id_l4 = existing.get("session_id", "")
+                if session_id_l4 and any(k in lowered for k in _CONFIRM_KEYWORDS | {"계속", "continue", "진행"}):
+                    pending_l4 = self._pending_l4.get(session_id_l4)
+                    if pending_l4:
+                        await say(text="계속 진행합니다.", thread_ts=thread_ts)
+                        asyncio.create_task(self._resume_graph(
+                            pending_l4["graph"], pending_l4["config"],
+                            "continue", channel, thread_ts, session_id_l4,
+                        ))
+                        self._pending_l4.pop(session_id_l4, None)
+                        return
+                elif session_id_l4 and any(k in lowered for k in _CANCEL_KEYWORDS):
+                    pending_l4 = self._pending_l4.get(session_id_l4)
+                    if pending_l4:
+                        await say(text="작업을 중단합니다.", thread_ts=thread_ts)
+                        asyncio.create_task(self._resume_graph(
+                            pending_l4["graph"], pending_l4["config"],
+                            "abort", channel, thread_ts, session_id_l4,
+                        ))
+                        self._pending_l4.pop(session_id_l4, None)
+                        return
                 await say(
                     text="L4 에스컬레이션 버튼을 사용하여 작업을 계속하거나 중단해 주세요.",
                     thread_ts=thread_ts,
@@ -842,14 +867,14 @@ class SlackInterface(BaseInterface):
                         task_id_l4 = gs.get("current_task_id", "?")
                         final_rpt  = gs.get("final_report", "수동 개입 필요")
                         state_obj = self._pending_clarification.get(thread_ts, {})
-                        state_obj.update({"stage": "l4_waiting", "task_id": task_id_l4})
+                        state_obj.update({"stage": "l4_waiting", "task_id": task_id_l4, "session_id": session_id})
                         self._pending_clarification[thread_ts] = state_obj
                         await self._persist(thread_ts)
                         self._pending_l4[session_id] = {
                             "channel": channel, "thread_ts": thread_ts,
                             "graph": graph, "config": config, "task_id": task_id_l4,
                         }
-                        await self.send_l4_prompt(channel, thread_ts, task_id_l4, str(final_rpt))
+                        await self.send_l4_prompt(channel, thread_ts, task_id_l4, str(final_rpt), session_id=session_id)
                         return
 
                     elif "present_plan" in next_nodes:
@@ -1505,7 +1530,7 @@ def _build_plan_blocks(session_id: str, plan_md: str) -> list[dict]:
     ]
 
 
-def _build_l4_blocks(task_id: str, summary: str) -> list[dict]:
+def _build_l4_blocks(session_id: str, task_id: str, summary: str) -> list[dict]:
     return [
         {
             "type": "section",
@@ -1526,14 +1551,14 @@ def _build_l4_blocks(task_id: str, summary: str) -> list[dict]:
                     "text": {"type": "plain_text", "text": "계속 진행"},
                     "style": "primary",
                     "action_id": "l4_continue",
-                    "value": task_id,
+                    "value": session_id,
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "중단"},
                     "style": "danger",
                     "action_id": "l4_abort",
-                    "value": task_id,
+                    "value": session_id,
                 },
             ],
         },
