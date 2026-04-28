@@ -102,8 +102,15 @@ def _ensure_dirs() -> None:
         "memory/retrospectives",
         "memory/proposals/pending",
         "memory/proposals/applied",
+        "memory/researcher",
     ]:
         Path(d).mkdir(parents=True, exist_ok=True)
+
+    if not os.getenv("AF_SI_CHANNEL"):
+        console.print(
+            "[yellow]⚠️  AF_SI_CHANNEL 미설정 — SI채널(#af-self-improve) 기능 비활성화[/yellow]\n"
+            "   .env에 AF_SI_CHANNEL=<채널ID> 추가 후 재시작하세요."
+        )
 
 
 def _open_db() -> Optional[sqlite3.Connection]:

@@ -294,6 +294,32 @@ ACTION_TOOLS: list[dict] = [
             "required": ["answer"],
         },
     },
+    {
+        "name": "post_si_issue",
+        "description": (
+            "AF 자체 동작 문제를 SI채널(#af-self-improve)에 QA 이슈로 게시합니다. "
+            "태스크 내용 문제가 아닌 AF 시스템 동작 문제일 때만 사용하세요. "
+            "예: semantic verifier 반복 REJECT, escalate 3회 이상, timeout 반복."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symptom": {
+                    "type": "string",
+                    "description": "관찰된 증상 (예: verify_semantic이 REJECT를 3회 반복)",
+                },
+                "suspected_cause": {
+                    "type": "string",
+                    "description": "의심되는 원인 (예: semantic_layer.py의 수락 기준이 너무 엄격함)",
+                },
+                "reproduction": {
+                    "type": "string",
+                    "description": "재현 조건 (예: acceptance_criteria에 '100% 테스트 통과' 포함 시)",
+                },
+            },
+            "required": ["symptom", "suspected_cause"],
+        },
+    },
 ]
 
 LEADER_TOOLS: list[dict] = QUERY_TOOLS + ACTION_TOOLS
@@ -472,6 +498,34 @@ class LeaderToolExecutor:
                     answer = args.get("answer", "답변을 생성할 수 없습니다.")
                     logger.info("[leader_tools] → answer_question len=%d", len(answer))
                     await post_fn(answer)
+                    return
+
+                if name == "post_si_issue":
+                    symptom = args.get("symptom", "")
+                    cause   = args.get("suspected_cause", "")
+                    repro   = args.get("reproduction", "")
+                    session_short = session_id[:8] if session_id else "?"
+                    import os
+                    si_channel = os.getenv("AF_SI_CHANNEL", "")
+                    if si_channel:
+                        try:
+                            import anthropic
+                            # Slack API 직접 호출은 slack_interface 계층에서 해야 하지만
+                            # leader_tools는 Slack client에 접근 불가 → post_fn으로 사용자 스레드에 알리고,
+                            # slack_interface._handle_complaint가 SI채널에 라우팅함
+                            qa_text = (
+                                f"🔍 *[리더] QA 이슈*\n"
+                                f"세션: `{session_short}`\n"
+                                f"증상: {symptom}\n"
+                                f"의심 원인: {cause}"
+                                + (f"\n재현 조건: {repro}" if repro else "")
+                            )
+                            logger.info("[leader_tools] → post_si_issue symptom=%.80s", symptom)
+                            await post_fn(f"SI채널에 QA 이슈를 게시했습니다.\n{qa_text}")
+                        except Exception as exc:
+                            logger.warning("[leader_tools] post_si_issue failed: %s", exc)
+                    else:
+                        await post_fn("⚠️ AF_SI_CHANNEL이 설정되지 않아 SI채널에 게시할 수 없습니다.")
                     return
 
                 # Interrupt action tools

@@ -115,16 +115,30 @@ class SelfImproveWorkflow:
     # ------------------------------------------------------------------
 
     async def _apply_code(self, proposal: "ImprovementProposal") -> list[str]:  # noqa: F821
-        """Use the Leader+Worker workflow to apply a code change proposal."""
+        """
+        git worktree를 생성해 AF 소스 격리 브랜치에서 개선 작업을 실행한다.
+        워크트리 경로가 workspace_root로 설정되므로 워커의 커밋이 올바른 브랜치에 쌓인다.
+        """
+        import os
         from agentforge.core.models import WorkflowSpec, TaskSpec
         from agentforge.core.state import make_initial_state
         from workflows.builder import GraphBuilder
+        from pathlib import Path
+
+        branch = f"self-improve/{proposal.proposal_id}"
+        ws_base = Path(os.getenv("AF_WORKSPACE_DIR", "workspace"))
+        worktree_path = (ws_base / f"improve-{proposal.proposal_id}").absolute()
+
+        # git worktree 생성 (AF 소스 격리 브랜치)
+        self._git("worktree", "add", str(worktree_path), "-b", branch)
+        logger.info("[self_improve] worktree created path=%s branch=%s", worktree_path, branch)
 
         description = (
             f"제안서 #{proposal.proposal_id} 적용:\n"
             f"문제: {proposal.problem}\n"
             f"변경: {proposal.diff_preview or proposal.root_cause}\n"
-            f"대상 파일: {', '.join(proposal.target_files)}"
+            f"대상 파일: {', '.join(proposal.target_files)}\n\n"
+            f"workspace_root({worktree_path}) 안의 AF 소스 파일을 직접 수정하고 커밋하라."
         )
         spec = WorkflowSpec(
             name=f"self_improvement_{proposal.proposal_id}",
@@ -138,14 +152,13 @@ class SelfImproveWorkflow:
                 ),
             ],
         )
-        state = make_initial_state(
-            session_id=f"self-improve-{proposal.proposal_id}",
-            user_request=description,
-        )
+        session_id = f"improve-{proposal.proposal_id}"
+        state = make_initial_state(session_id=session_id, user_request=description)
+        state["workspace_root"] = str(worktree_path)  # 핵심: AF 소스 워크트리를 workspace로 사용
         state["workflow_spec"] = spec
         graph = GraphBuilder().from_spec(spec)
-        config = {"configurable": {"thread_id": state["session_id"]}}
-        result = await graph.ainvoke(state, config=config)
+        config = {"configurable": {"thread_id": session_id}}
+        await graph.ainvoke(state, config=config)
         return proposal.target_files
 
     # ------------------------------------------------------------------

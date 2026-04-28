@@ -59,12 +59,18 @@ class SlackInterface(BaseInterface):
         self._handler: Any = None
         self._bot_user_id: str = ""
 
+        self._si_channel: str = os.getenv("AF_SI_CHANNEL", "")
+
         # In-memory cache: thread_ts → state dict (backed by ThreadContextStore)
         self._pending_clarification: dict[str, dict] = {}
         # session_id → pending L4 info (also persisted via thread_contexts stage=l4_waiting)
         self._pending_l4: dict[str, dict] = {}
         # session_id → Slack message ts for the live status message (updated in-place)
         self._status_ts: dict[str, str] = {}
+
+        # ScribeAgent / ResearcherAgent — initialized lazily after Slack app is ready
+        self._scribe: Any = None
+        self._researcher: Any = None
 
     # ------------------------------------------------------------------
     # BaseInterface
@@ -91,6 +97,14 @@ class SlackInterface(BaseInterface):
         )
         self._register_handlers()
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
+
+        # ScribeAgent / ResearcherAgent 초기화 (Slack 앱 준비 후)
+        from agentforge.observer.scribe import ScribeAgent
+        from agentforge.observer.researcher import ResearcherAgent
+        self._scribe = ScribeAgent(self._app.client, self._si_channel)
+        self._researcher = ResearcherAgent(self._app.client, self._si_channel)
+        if not self._si_channel:
+            logger.warning("AF_SI_CHANNEL 미설정 — SI채널 기능 비활성화")
 
         await self._log_startup_info()
 
@@ -297,6 +311,25 @@ class SlackInterface(BaseInterface):
             if self._bot_user_id and f"<@{self._bot_user_id}>" in text:
                 return
 
+            # SI채널 메시지 → 연구자에게 전달
+            if self._si_channel and channel == self._si_channel:
+                user_id = event.get("user", "")
+                if self._researcher:
+                    asyncio.create_task(
+                        self._researcher.on_si_message(channel, thread_ts, user_id, text)
+                    )
+                return
+
+            # 연구자가 만든 개선 채널 → 해당 채널을 새 리더 세션으로 라우팅
+            if self._researcher and channel in self._researcher.improvement_channels:
+                user_text = text.strip()
+                if user_text:
+                    task = asyncio.create_task(
+                        self._handle_improvement_channel_message(client, channel, event.get("ts", ""), user_text)
+                    )
+                    task.add_done_callback(self._on_task_done)
+                return
+
             # Handle reply inside an active clarification thread (no mention required)
             if thread_ts and thread_ts in self._pending_clarification:
                 user_text = text.strip()
@@ -308,7 +341,6 @@ class SlackInterface(BaseInterface):
                 return
 
             # All other messages: observed but not acted upon
-            # (Historian / complaint detection could be wired here in the future)
 
         # Clarification confirm / cancel
         @app.action("clarify_confirm")
@@ -351,6 +383,53 @@ class SlackInterface(BaseInterface):
         async def handle_plan_modify(body: dict, ack: Any) -> None:
             await ack()
             await self._on_plan_action(body, action="modify_request")
+
+        # --- SI채널 / 연구자 제안 핸들러 ---
+
+        @app.action("proposal_approve")
+        async def handle_proposal_approve(body: dict, ack: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                asyncio.create_task(self._researcher.execute_improvement(proposal_id))
+
+        @app.action("proposal_reject")
+        async def handle_proposal_reject(body: dict, ack: Any, client: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                asyncio.create_task(self._researcher.handle_merge_cancel(proposal_id))
+
+        @app.action("proposal_auto_approve")
+        async def handle_proposal_auto_approve(body: dict, ack: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                async def _delayed():
+                    await asyncio.sleep(86400)  # 24시간
+                    await self._researcher.execute_improvement(proposal_id)
+                asyncio.create_task(_delayed())
+
+        @app.action("improvement_merge")
+        async def handle_improvement_merge(body: dict, ack: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                asyncio.create_task(self._researcher.handle_merge_approve(proposal_id))
+
+        @app.action("improvement_cancel")
+        async def handle_improvement_cancel(body: dict, ack: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                asyncio.create_task(self._researcher.handle_merge_cancel(proposal_id))
+
+        @app.action("improvement_diff")
+        async def handle_improvement_diff(body: dict, ack: Any) -> None:
+            await ack()
+            proposal_id = (body.get("actions") or [{}])[0].get("value", "")
+            if self._researcher and proposal_id:
+                asyncio.create_task(self._researcher.handle_diff_view(proposal_id))
 
     # ------------------------------------------------------------------
     # Clarification flow
@@ -704,6 +783,16 @@ class SlackInterface(BaseInterface):
         from agentforge.observer.historian import Historian
         historian = Historian()
 
+        # ScribeAgent: 세션 스레드 시작
+        if self._scribe:
+            asyncio.create_task(
+                self._scribe.start_session_thread(
+                    session_id=session_id,
+                    workflow_name="AF 세션",
+                    task_count=0,
+                )
+            )
+
         logger.info("Graph streaming started: session=%s", session_id[:8])
         final_report = ""
         error_msg    = ""
@@ -776,6 +865,26 @@ class SlackInterface(BaseInterface):
                             elapsed_s=float(rdur) if rdur else 0.0,
                             tokens=int(rtok) if rtok else 0,
                         ))
+                        # ScribeAgent: 태스크 완료 기록
+                        if self._scribe:
+                            node_obj2 = task_nodes.get(tid)
+                            inst = (node_obj2.get("instruction") if isinstance(node_obj2, dict)
+                                    else getattr(node_obj2, "instruction", None)) if node_obj2 else None
+                            title = getattr(inst, "title", tid) if inst else tid
+                            criteria = getattr(inst, "acceptance_criteria", []) if inst else []
+                            asyncio.create_task(self._scribe.record_task_event(
+                                session_id=session_id,
+                                task_id=tid,
+                                task_title=title,
+                                task_index=n_done,
+                                total_tasks=total,
+                                event_type="merge" if is_completed else "error",
+                                payload={
+                                    "elapsed_s": float(rdur) if rdur else 0.0,
+                                    "tokens": int(rtok) if rtok else 0,
+                                    "acceptance_criteria": criteria,
+                                },
+                            ))
 
                 elif event_name == "on_chain_end" and node_name == "escalate":
                     output = event.get("data", {}).get("output", {}) or {}
@@ -834,6 +943,16 @@ class SlackInterface(BaseInterface):
                         elapsed_s=0.0,
                         tokens=0,
                     ))
+                    # ScribeAgent: 세션 종료 요약
+                    if self._scribe:
+                        asyncio.create_task(self._scribe.end_session(
+                            session_id=session_id,
+                            total_tasks=0, succeeded=0, failed=0,
+                            total_tokens=0, elapsed_minutes=0.0,
+                        ))
+                    # ResearcherAgent: 5분 후 세션 회고 트리거
+                    if self._researcher:
+                        asyncio.create_task(self._researcher.on_session_end(session_id))
 
         except Exception as exc:
             logger.exception("Graph streaming error: %s", exc)
@@ -1571,29 +1690,42 @@ class SlackInterface(BaseInterface):
     # Complaint handling
     # ------------------------------------------------------------------
 
+    async def _handle_improvement_channel_message(
+        self, client: Any, channel: str, ts: str, text: str
+    ) -> None:
+        """연구자가 만든 개선 채널 메시지를 새 리더 세션으로 처리한다."""
+        try:
+            from agentforge.core.state import make_initial_state
+            from agentforge.core.checkpoint import get_checkpointer
+            from workflows.builder import GraphBuilder
+
+            session_id = f"improve-{ts[:8]}"
+            state = make_initial_state(session_id=session_id, user_request=text)
+            graph = GraphBuilder().from_spec(
+                __import__("agentforge.core.models", fromlist=["WorkflowSpec"]).WorkflowSpec(
+                    name=f"improvement_{session_id}"
+                )
+            )
+            asyncio.create_task(
+                self.stream_graph_to_slack(graph, state, channel, ts, session_id)
+            )
+        except Exception as exc:
+            logger.warning("[improvement channel] handler error: %s", exc)
+
     async def _handle_complaint(
         self, user_id: str, message: str, channel: str, thread_ts: str
     ) -> None:
         try:
             from agentforge.observer.historian import Historian
-            from agentforge.observer.retrospective import RetrospectiveAgent
-            from pathlib import Path
-
             historian = Historian()
             await historian.record_complaint(user_id, message)
 
-            retro    = RetrospectiveAgent()
-            proposal = await retro.analyze(
-                Path("memory/journal"), trigger="complaint", context=message
-            )
-            if proposal:
-                text = (
-                    f"개선 제안 #{proposal.proposal_id}\n\n"
-                    f"*문제*: {proposal.problem}\n"
-                    f"*제안*: {proposal.suggested_change}\n\n"
-                    "수락/거부 버튼을 통해 응답해 주세요."
+            # SI채널에 QA 이슈로도 게시 (연구자가 분석)
+            if self._si_channel and self._researcher:
+                await self._researcher.on_si_message(
+                    self._si_channel, None, user_id,
+                    f"[리더 QA] {message}"
                 )
-                await self.send_message(channel, text, thread_ts=thread_ts)
         except Exception as exc:
             logger.warning("Complaint handling error: %s", exc)
 
