@@ -376,6 +376,37 @@ ACTION_TOOLS: list[dict] = [
 
 LEADER_TOOLS: list[dict] = QUERY_TOOLS + ACTION_TOOLS
 
+_FILE_TOOLS = {"read_local_file", "list_local_directory"}
+
+
+def _resolve_max_turns(tools: list[dict], allow_actions: bool) -> int:
+    """
+    작업 복잡도에 따라 최대 턴 수를 결정한다.
+
+    우선순위:
+    1. 환경변수 AF_LEADER_MAX_TURNS — 사용자가 직접 지정한 값 (무조건 우선)
+    2. 파일 탐색 도구 포함 여부 — 로컬 파일 읽기는 여러 턴이 필요
+    3. allow_actions 여부 — 조회 전용은 짧게, 액션 포함은 길게
+
+    기본값 (env 미설정):
+      - 조회 전용(allow_actions=False):                  8턴
+      - 액션 포함, 파일 도구 없음:                       12턴
+      - 액션 포함, 파일 도구 있음 (로컬 경로 탐색 등):   20턴
+    """
+    env_val = os.getenv("AF_LEADER_MAX_TURNS", "").strip()
+    if env_val.isdigit():
+        return max(1, int(env_val))
+
+    tool_names = {t.get("name") for t in tools}
+    has_file_tools = bool(tool_names & _FILE_TOOLS)
+
+    if not allow_actions:
+        return 8
+    if has_file_tools:
+        return 20
+    return 12
+
+
 _SYSTEM_PROMPT = """\
 당신은 AgentForge 소프트웨어 개발 AI 시스템의 어시스턴트입니다.
 Slack 스레드에서 사용자의 @멘션을 처리합니다.
@@ -470,8 +501,11 @@ class LeaderToolExecutor:
         ]
 
         client = anthropic.AsyncAnthropic()
+        max_turns = _resolve_max_turns(tools, allow_actions)
+        logger.info("[leader_tools] max_turns=%d allow_actions=%s tools=%d",
+                    max_turns, allow_actions, len(tools))
 
-        for turn in range(20):
+        for turn in range(max_turns):
             try:
                 response = await client.messages.create(
                     model=SONNET,
