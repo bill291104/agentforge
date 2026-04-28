@@ -137,6 +137,40 @@ class ScribeAgent:
             logger.warning("[scribe] record_task_event failed task=%s event=%s: %s",
                            task_id, event_type, exc)
 
+    async def record_pre_session_error(
+        self,
+        channel_name: str,
+        user_id: str,
+        error_msg: str,
+        traceback_text: str = "",
+    ) -> None:
+        """세션 시작 전(명확화·라우팅 단계)에 발생한 에러를 SI채널에 독립 메시지로 게시한다."""
+        if _MOCK or not self._si_channel:
+            logger.info("[scribe][mock] record_pre_session_error: %s", error_msg)
+            return
+
+        ts_str = datetime.now(UTC).strftime("%H:%M UTC")
+        text = (
+            f"⚠️ *Pre-session 에러* | {ts_str}\n"
+            f"채널: #{channel_name} | 사용자: <@{user_id}>\n"
+            f"에러: `{error_msg[:200]}`"
+        )
+        if traceback_text:
+            # 마지막 10줄만 포함 (가장 관련성 높은 부분)
+            tb_lines = traceback_text.strip().splitlines()[-10:]
+            text += "\n```\n" + "\n".join(tb_lines) + "\n```"
+
+        try:
+            await self._client.chat_postMessage(
+                channel=self._si_channel,
+                text=text,
+                username=self._USERNAME,
+                icon_emoji=self._ICON,
+            )
+            logger.info("[scribe] pre_session_error posted: %s", error_msg[:80])
+        except Exception as exc:
+            logger.warning("[scribe] record_pre_session_error failed: %s", exc)
+
     async def end_session(
         self,
         session_id: str,

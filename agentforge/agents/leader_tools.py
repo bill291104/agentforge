@@ -116,6 +116,58 @@ QUERY_TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "read_local_file",
+        "description": (
+            "로컬 파일 시스템의 파일을 읽습니다. 절대 경로를 사용하세요. "
+            "사용자가 특정 경로의 파일을 읽어달라고 할 때 사용합니다. "
+            "예: C:/projects/README.md, /home/user/config.yaml"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "읽을 파일의 절대 경로 (예: C:/aether-j/README.md)",
+                },
+                "encoding": {
+                    "type": "string",
+                    "description": "파일 인코딩 (기본: utf-8). 한글 파일에는 utf-8 또는 cp949.",
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "반환할 최대 줄 수 (기본: 300). 큰 파일은 이 값을 늘리세요.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "list_local_directory",
+        "description": (
+            "로컬 디렉토리의 파일/폴더 목록을 반환합니다. 절대 경로를 사용하세요. "
+            "프로젝트 구조 파악, 파일 존재 확인 등에 사용합니다. "
+            "예: C:/aether-j, /home/user/projects"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "조회할 디렉토리의 절대 경로",
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "하위 디렉토리 포함 여부 (기본: false). 대형 프로젝트는 false 권장.",
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "숨김 파일(.으로 시작) 포함 여부 (기본: false)",
+                },
+            },
+            "required": ["path"],
+        },
+    },
 ]
 
 INTERRUPT_TOOLS: list[dict] = [
@@ -509,7 +561,6 @@ class LeaderToolExecutor:
                     si_channel = os.getenv("AF_SI_CHANNEL", "")
                     if si_channel:
                         try:
-                            import anthropic
                             # Slack API 직접 호출은 slack_interface 계층에서 해야 하지만
                             # leader_tools는 Slack client에 접근 불가 → post_fn으로 사용자 스레드에 알리고,
                             # slack_interface._handle_complaint가 SI채널에 라우팅함
@@ -659,6 +710,10 @@ class LeaderToolExecutor:
                 return await self._get_git_history(args)
             if name == "list_all_sessions":
                 return await self._list_all_sessions(args)
+            if name == "read_local_file":
+                return await self._read_local_file(args)
+            if name == "list_local_directory":
+                return await self._list_local_directory(args)
             return f"알 수 없는 도구: {name}"
         except Exception as exc:
             logger.warning("Tool %s error: %s", name, exc)
@@ -828,3 +883,119 @@ class LeaderToolExecutor:
         for thread_id, steps, _ in rows:
             lines.append(f"  - {thread_id} (체크포인트: {steps}개)")
         return "\n".join(lines)
+
+    async def _read_local_file(self, args: dict) -> str:
+        import aiofiles
+        path_str = args.get("path", "").strip()
+        encoding = args.get("encoding", "utf-8")
+        max_lines = int(args.get("max_lines", 300))
+
+        if not path_str:
+            return "path 파라미터가 필요합니다."
+
+        path = Path(path_str)
+        if not path.exists():
+            return f"파일을 찾을 수 없습니다: {path_str}"
+        if not path.is_file():
+            return f"경로가 파일이 아닙니다: {path_str}"
+
+        try:
+            async with aiofiles.open(path, encoding=encoding, errors="replace") as f:
+                content = await f.read()
+        except PermissionError:
+            return f"파일 읽기 권한이 없습니다: {path_str}"
+        except Exception as exc:
+            return f"파일 읽기 오류: {exc}"
+
+        lines = content.splitlines()
+        total = len(lines)
+        if total > max_lines:
+            lines = lines[:max_lines]
+            footer = f"\n... (총 {total}줄 중 {max_lines}줄 표시. max_lines를 늘리면 더 볼 수 있습니다)"
+        else:
+            footer = ""
+
+        return "\n".join(lines) + footer
+
+    async def _list_local_directory(self, args: dict) -> str:
+        import os as _os
+        from datetime import datetime as _dt
+
+        path_str = args.get("path", "").strip()
+        recursive = bool(args.get("recursive", False))
+        include_hidden = bool(args.get("include_hidden", False))
+        max_items = 500
+
+        if not path_str:
+            return "path 파라미터가 필요합니다."
+
+        path = Path(path_str)
+        if not path.exists():
+            return f"경로를 찾을 수 없습니다: {path_str}"
+        if not path.is_dir():
+            return f"경로가 디렉토리가 아닙니다: {path_str}"
+
+        try:
+            entries: list[tuple[str, str, int, str]] = []  # (type, rel_path, size, mtime)
+
+            if recursive:
+                for root, dirs, files in _os.walk(path):
+                    if not include_hidden:
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    root_path = Path(root)
+                    for name in sorted(dirs):
+                        if not include_hidden and name.startswith("."):
+                            continue
+                        rel = str((root_path / name).relative_to(path))
+                        entries.append(("D", rel, 0, ""))
+                    for name in sorted(files):
+                        if not include_hidden and name.startswith("."):
+                            continue
+                        fp = root_path / name
+                        try:
+                            stat = fp.stat()
+                            size = stat.st_size
+                            mtime = _dt.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        except OSError:
+                            size, mtime = 0, ""
+                        rel = str(fp.relative_to(path))
+                        entries.append(("F", rel, size, mtime))
+                    if len(entries) >= max_items:
+                        break
+            else:
+                for item in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name)):
+                    if not include_hidden and item.name.startswith("."):
+                        continue
+                    if item.is_dir():
+                        entries.append(("D", item.name, 0, ""))
+                    else:
+                        try:
+                            stat = item.stat()
+                            size = stat.st_size
+                            mtime = _dt.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        except OSError:
+                            size, mtime = 0, ""
+                        entries.append(("F", item.name, size, mtime))
+
+        except PermissionError:
+            return f"디렉토리 읽기 권한이 없습니다: {path_str}"
+        except Exception as exc:
+            return f"디렉토리 조회 오류: {exc}"
+
+        if not entries:
+            return f"{path_str}: 비어있는 디렉토리"
+
+        truncated = ""
+        if len(entries) >= max_items:
+            truncated = f"\n... (최대 {max_items}개 표시됨)"
+            entries = entries[:max_items]
+
+        lines = [f"{path_str} ({len(entries)}개 항목):"]
+        for typ, name, size, mtime in entries:
+            if typ == "D":
+                lines.append(f"  [D] {name}/")
+            else:
+                size_str = f"{size:,}B" if size < 1024 else f"{size // 1024:,}KB"
+                lines.append(f"  [F] {name}  {size_str}  {mtime}")
+
+        return "\n".join(lines) + truncated

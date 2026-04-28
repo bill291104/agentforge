@@ -72,6 +72,9 @@ class SlackInterface(BaseInterface):
         self._scribe: Any = None
         self._researcher: Any = None
 
+        # task id → {channel, thread_ts, user_id} for error reporting in _on_task_done
+        self._task_ctx: dict[int, dict] = {}
+
     # ------------------------------------------------------------------
     # BaseInterface
     # ------------------------------------------------------------------
@@ -252,11 +255,57 @@ class SlackInterface(BaseInterface):
         )
 
     def _on_task_done(self, task: "asyncio.Task") -> None:
+        ctx = self._task_ctx.pop(id(task), {})
         if task.cancelled():
             return
         exc = task.exception()
         if exc:
+            import traceback as _tb
+            tb_text = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
             logger.exception("Background task failed: %s", exc, exc_info=exc)
+
+            channel   = ctx.get("channel", "")
+            thread_ts = ctx.get("thread_ts", "")
+            user_id   = ctx.get("user_id", "")
+
+            # 사용자 스레드에 에러 알림 (thread_ts가 있을 때만)
+            if channel and thread_ts and self._app:
+                import asyncio as _asyncio
+                _asyncio.create_task(
+                    self._app.client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                    )
+                )
+
+            # SI채널에 pre-session 에러 게시
+            if self._scribe and self._si_channel:
+                channel_name = channel or "unknown"
+                import asyncio as _asyncio
+                _asyncio.create_task(
+                    self._scribe.record_pre_session_error(
+                        channel_name=channel_name,
+                        user_id=user_id or "unknown",
+                        error_msg=str(exc),
+                        traceback_text=tb_text,
+                    )
+                )
+
+    def _create_task(
+        self,
+        coro: "Any",
+        *,
+        channel: str = "",
+        thread_ts: str = "",
+        user_id: str = "",
+    ) -> "asyncio.Task":
+        """asyncio.create_task + _on_task_done 등록 + 컨텍스트 저장 헬퍼."""
+        import asyncio as _asyncio
+        task = _asyncio.create_task(coro)
+        self._task_ctx[id(task)] = {"channel": channel, "thread_ts": thread_ts, "user_id": user_id}
+        task.add_done_callback(self._on_task_done)
+        return task
 
     # ------------------------------------------------------------------
     # Slack handlers
@@ -324,20 +373,26 @@ class SlackInterface(BaseInterface):
             if self._researcher and channel in self._researcher.improvement_channels:
                 user_text = text.strip()
                 if user_text:
-                    task = asyncio.create_task(
-                        self._handle_improvement_channel_message(client, channel, event.get("ts", ""), user_text)
+                    _uid = event.get("user", "")
+                    self._create_task(
+                        self._handle_improvement_channel_message(client, channel, event.get("ts", ""), user_text),
+                        channel=channel,
+                        thread_ts=event.get("ts", ""),
+                        user_id=_uid,
                     )
-                    task.add_done_callback(self._on_task_done)
                 return
 
             # Handle reply inside an active clarification thread (no mention required)
             if thread_ts and thread_ts in self._pending_clarification:
                 user_text = text.strip()
                 if user_text:
-                    task = asyncio.create_task(
-                        self._handle_clarification_reply(client, channel, thread_ts, user_text)
+                    _uid = event.get("user", "")
+                    self._create_task(
+                        self._handle_clarification_reply(client, channel, thread_ts, user_text),
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        user_id=_uid,
                     )
-                    task.add_done_callback(self._on_task_done)
                 return
 
             # All other messages: observed but not acted upon
@@ -462,22 +517,22 @@ class SlackInterface(BaseInterface):
             )
             if stage == "running":
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_running_thread(
                             self._app.client, existing, request, channel, thread_ts
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 return
             if stage == "l2_waiting":
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_interrupt_thread(
                             self._app.client, existing, request, channel, thread_ts,
                             interrupt_type="l2",
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 else:
                     await say(
                         text="버튼으로 업그레이드 승인/중단을 선택하거나, 메시지로 의사를 알려주세요.",
@@ -486,13 +541,13 @@ class SlackInterface(BaseInterface):
                 return
             if stage == "l4_waiting":
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_interrupt_thread(
                             self._app.client, existing, request, channel, thread_ts,
                             interrupt_type="l4",
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 else:
                     await say(
                         text="L4 에스컬레이션 버튼을 사용하거나 메시지로 계속/중단 의사를 알려주세요.",
@@ -501,13 +556,13 @@ class SlackInterface(BaseInterface):
                 return
             if stage == "plan_waiting":
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_interrupt_thread(
                             self._app.client, existing, request, channel, thread_ts,
                             interrupt_type="plan",
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 else:
                     await say(
                         text="계획서 버튼으로 승인/수정 요청을 하거나, 메시지로 의사를 알려주세요.",
@@ -536,23 +591,23 @@ class SlackInterface(BaseInterface):
                 return
             if stage == "completed":
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_completed_thread(
                             self._app.client, existing, request, channel, thread_ts, user_id
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 return
             if stage in ("clarifying", "confirming"):
                 # @mention in a clarifying thread → LeaderAgent decides intent.
                 # Plain replies (no mention) go through _handle_clarification_reply directly.
                 if request:
-                    task = asyncio.create_task(
+                    self._create_task(
                         self._dispatch_clarifying_thread(
                             self._app.client, existing, request, channel, thread_ts, user_id
-                        )
+                        ),
+                        channel=channel, thread_ts=thread_ts, user_id=user_id,
                     )
-                    task.add_done_callback(self._on_task_done)
                 return
 
         if not request:
@@ -581,10 +636,10 @@ class SlackInterface(BaseInterface):
         self._pending_clarification[thread_ts] = state
         await self._persist(thread_ts)
 
-        task = asyncio.create_task(
-            self._run_clarification_turn(self._app.client, channel, thread_ts)
+        self._create_task(
+            self._run_clarification_turn(self._app.client, channel, thread_ts),
+            channel=channel, thread_ts=thread_ts, user_id=user_id,
         )
-        task.add_done_callback(self._on_task_done)
 
     async def _handle_clarification_reply(
         self, client: Any, channel: str, thread_ts: str, user_text: str
@@ -747,10 +802,10 @@ class SlackInterface(BaseInterface):
         state_obj = make_initial_state(session_id=session_id, user_request=summary)
         graph     = _build_graph()
 
-        task = asyncio.create_task(
-            self.stream_graph_to_slack(graph, state_obj, channel, thread_ts, session_id)
+        self._create_task(
+            self.stream_graph_to_slack(graph, state_obj, channel, thread_ts, session_id),
+            channel=channel, thread_ts=thread_ts,
         )
-        task.add_done_callback(self._on_task_done)
 
     # ------------------------------------------------------------------
     # Graph streaming
@@ -1260,10 +1315,10 @@ class SlackInterface(BaseInterface):
         self._pending_clarification[thread_ts] = state
         await self._persist(thread_ts)
 
-        task = asyncio.create_task(
-            self.stream_graph_to_slack(graph, None, channel, thread_ts, session_id)
+        self._create_task(
+            self.stream_graph_to_slack(graph, None, channel, thread_ts, session_id),
+            channel=channel, thread_ts=thread_ts,
         )
-        task.add_done_callback(self._on_task_done)
 
     # ------------------------------------------------------------------
     # Completed / running thread dispatchers (tool calling)
