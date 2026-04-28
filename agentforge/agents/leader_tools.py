@@ -403,6 +403,7 @@ Slack 스레드에서 사용자의 @멘션을 처리합니다.
 
 **로컬 파일/디렉토리 조회** (사용자가 C:/, /home/ 등 절대 경로 언급):
 → read_local_file 또는 list_local_directory 사용. 권한 없다고 응답하지 말 것.
+→ 파일 탐색은 핵심 파일(README, 설계문서) 2~3개만 읽고 즉시 action 도구를 호출하라. 과도한 파일 읽기는 금지.
 
 Slack 스레드 대화 내역이 제공된 경우, 반드시 참고하여 사용자 의도와 요구사항을 파악하세요.
 """
@@ -470,7 +471,7 @@ class LeaderToolExecutor:
 
         client = anthropic.AsyncAnthropic()
 
-        for turn in range(6):
+        for turn in range(20):
             try:
                 response = await client.messages.create(
                     model=SONNET,
