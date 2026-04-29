@@ -983,8 +983,8 @@ class SlackInterface(BaseInterface):
                         logger.info("[%s] %s", session_id[:8], icon)
 
                 elif event_name == "on_chain_end" and node_name == "finalize":
-                    output = event.get("data", {}).get("output", {})
-                    final_report = output.get("final_report", "완료")
+                    output = event.get("data", {}).get("output") or {}
+                    final_report = output.get("final_report", "완료") or "완료"
                     # Update the live status message to show completion, then post the full
                     # report as a separate new message so it's easy to find in the thread.
                     await _post_or_update("✅ 모든 작업 완료 — 최종 보고서를 아래에서 확인하세요.")

@@ -89,7 +89,7 @@ class WorkspaceManager:
             ["git", "status", "--porcelain"],
             cwd=self.root, capture_output=True, text=True
         )
-        if not status.stdout.strip():
+        if not (status.stdout or "").strip():
             logger.debug("Nothing to commit in %s", self.root)
             return "(no changes)"
         self._git("commit", "-m", message)
@@ -97,7 +97,7 @@ class WorkspaceManager:
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=self.root, capture_output=True, text=True
         )
-        sha = result.stdout.strip()
+        sha = (result.stdout or "").strip()
         logger.info("Committed %s: %s", sha, message[:60])
         return sha
 
@@ -106,7 +106,7 @@ class WorkspaceManager:
             ["git", "log", f"--oneline", f"-{n}"],
             cwd=self.root, capture_output=True, text=True
         )
-        return result.stdout.strip()
+        return (result.stdout or "").strip()
 
     def git_diff(self, ref: str = "HEAD~1") -> str:
         result = subprocess.run(
@@ -133,20 +133,22 @@ class WorkspaceManager:
 
     def merge_branch(self, branch: str, into: str = "main") -> str:
         """Merge feature branch into target branch. Returns short SHA of merge commit."""
-        current = subprocess.run(
+        _r = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=self.root, capture_output=True, text=True,
-        ).stdout.strip()
+        )
+        current = (_r.stdout or "").strip()
         self._git("checkout", into)
         try:
             result = self._git("merge", "--no-ff", branch, "-m", f"merge: {branch} → {into}")
             if result.returncode != 0:
                 self._git("merge", "--abort")
                 raise subprocess.CalledProcessError(result.returncode, "merge", result.stderr)
-            sha = subprocess.run(
+            _sha_r = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
                 cwd=self.root, capture_output=True, text=True,
-            ).stdout.strip()
+            )
+            sha = (_sha_r.stdout or "").strip()
             logger.info("Merged %s → %s at %s", branch, into, sha)
             return sha
         finally:
@@ -159,7 +161,7 @@ class WorkspaceManager:
             ["git", "show", "--name-only", "--format=", sha],
             cwd=self.root, capture_output=True, text=True,
         )
-        return [f for f in result.stdout.strip().splitlines() if f.strip()]
+        return [f for f in (result.stdout or "").strip().splitlines() if f.strip()]
 
     def get_branch_diff_files(self, branch: str, base: str = "main") -> list[str]:
         """Return files changed in branch vs base (entire branch, not just last commit)."""
@@ -167,7 +169,7 @@ class WorkspaceManager:
             ["git", "diff", "--name-only", f"{base}...{branch}"],
             cwd=self.root, capture_output=True, text=True,
         )
-        return [f for f in result.stdout.strip().splitlines() if f.strip()]
+        return [f for f in (result.stdout or "").strip().splitlines() if f.strip()]
 
     def git_status_short(self) -> str:
         """Return short git status output (porcelain)."""
@@ -175,7 +177,7 @@ class WorkspaceManager:
             ["git", "status", "--short"],
             cwd=self.root, capture_output=True, text=True,
         )
-        return result.stdout.strip() or "(변경 없음)"
+        return (result.stdout or "").strip() or "(변경 없음)"
 
     def diff_files(self, base: str = "HEAD~1") -> list[str]:
         """Return list of file paths changed since base commit."""
@@ -183,7 +185,7 @@ class WorkspaceManager:
             ["git", "diff", "--name-only", base],
             cwd=self.root, capture_output=True, text=True,
         )
-        return [f for f in result.stdout.strip().splitlines() if f]
+        return [f for f in (result.stdout or "").strip().splitlines() if f]
 
     # ------------------------------------------------------------------
     # Test runner (Docker → local fallback)
