@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _MOCK = os.getenv("AF_MOCK_MODE", "false").lower() == "true"
 
-_CONFIRM_KEYWORDS = {"네", "예", "yes", "y", "진행", "ㅇㅇ", "ok", "확인", "go", "그래"}
+_CONFIRM_KEYWORDS = {"네", "예", "yes", "y", "진행", "ㅇㅇ", "ok", "확인", "go", "그래", "맞아", "맞어", "응", "ㅇ", "시작", "바로"}
 _CANCEL_KEYWORDS  = {"아니오", "아니", "no", "n", "취소", "cancel", "그만", "중단"}
 
 
