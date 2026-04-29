@@ -167,18 +167,13 @@ class ClarifierAgent:
             )
             raw = text_block.text.strip() if text_block else ""
 
-            # 1) 전체가 코드펜스인 경우 벗겨내기
-            if raw.startswith("```"):
-                lines = raw.split("\n")
-                raw = "\n".join(lines[1:-1]) if len(lines) > 2 else raw
-
-            # 2) 순수 JSON 파싱 시도
+            # 1) 순수 JSON 파싱 시도
             try:
                 return json.loads(raw)
             except json.JSONDecodeError:
                 pass
 
-            # 3) 혼합 응답(텍스트 + JSON 코드블록)에서 JSON 추출
+            # 2) 코드펜스 안의 JSON 추출 (```json {...} ``` 또는 ``` {...} ```)
             import re as _re
             json_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
             if json_match:
@@ -188,9 +183,9 @@ class ClarifierAgent:
                 except json.JSONDecodeError:
                     pass
 
-            # 4) 폴백: JSON 블록 제거 후 텍스트만 메시지로 반환
-            clean = _re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", raw, flags=_re.DOTALL).strip()
-            logger.warning("ClarifierAgent: non-JSON response: %.200s", raw)
+            # 3) 폴백: 모든 코드블록 제거 후 남은 텍스트를 메시지로 반환
+            clean = _re.sub(r"```.*?```", "", raw, flags=_re.DOTALL).strip()
+            logger.warning("ClarifierAgent: non-JSON response: %.200s", raw[:100])
             return {"status": "clarifying", "message": clean or raw}
 
         logger.error("[clarifier] max tool-call turns exceeded")
