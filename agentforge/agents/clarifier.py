@@ -167,16 +167,31 @@ class ClarifierAgent:
             )
             raw = text_block.text.strip() if text_block else ""
 
-            # Strip markdown code fences if present
+            # 1) 전체가 코드펜스인 경우 벗겨내기
             if raw.startswith("```"):
                 lines = raw.split("\n")
                 raw = "\n".join(lines[1:-1]) if len(lines) > 2 else raw
 
+            # 2) 순수 JSON 파싱 시도
             try:
                 return json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("ClarifierAgent: non-JSON response: %.200s", raw)
-                return {"status": "clarifying", "message": raw}
+                pass
+
+            # 3) 혼합 응답(텍스트 + JSON 코드블록)에서 JSON 추출
+            import re as _re
+            json_match = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, _re.DOTALL)
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group(1))
+                    return parsed
+                except json.JSONDecodeError:
+                    pass
+
+            # 4) 폴백: JSON 블록 제거 후 텍스트만 메시지로 반환
+            clean = _re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", raw, flags=_re.DOTALL).strip()
+            logger.warning("ClarifierAgent: non-JSON response: %.200s", raw)
+            return {"status": "clarifying", "message": clean or raw}
 
         logger.error("[clarifier] max tool-call turns exceeded")
         return {"status": "clarifying", "message": "요구사항을 파악하는 데 시간이 걸리고 있습니다. 조금 더 구체적으로 설명해 주실 수 있나요?"}
