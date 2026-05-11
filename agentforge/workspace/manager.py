@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -236,7 +237,7 @@ class WorkspaceManager:
         """Run pytest locally in the workspace directory."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                "python", "-m", "pytest", test_path, "-v", "--tb=short",
+                sys.executable, "-m", "pytest", test_path, "-v", "--tb=short",
                 cwd=self.root,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
